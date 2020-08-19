@@ -19,8 +19,11 @@
 
 package org.elasticsearch.search;
 
+import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.search.fetch.FetchSearchResult;
+import org.elasticsearch.search.internal.SearchContextId;
 import org.elasticsearch.search.query.QuerySearchResult;
 import org.elasticsearch.transport.TransportResponse;
 
@@ -38,7 +41,7 @@ public abstract class SearchPhaseResult extends TransportResponse {
 
     private SearchShardTarget searchShardTarget;
     private int shardIndex = -1;
-    protected long requestId;
+    protected SearchContextId contextId;
 
     protected SearchPhaseResult() {
 
@@ -49,10 +52,12 @@ public abstract class SearchPhaseResult extends TransportResponse {
     }
 
     /**
-     * Returns the results request ID that is used to reference the search context on the executing node
+     * Returns the search context ID that is used to reference the search context on the executing node
+     * or <code>null</code> if no context was created.
      */
-    public long getRequestId() {
-        return requestId;
+    @Nullable
+    public SearchContextId getContextId() {
+        return contextId;
     }
 
     /**
@@ -90,7 +95,7 @@ public abstract class SearchPhaseResult extends TransportResponse {
     public FetchSearchResult fetchResult() { return null; }
 
     @Override
-    public final void readFrom(StreamInput in) {
-        throw new UnsupportedOperationException("usage of Streamable is to be replaced by Writeable");
+    public void writeTo(StreamOutput out) throws IOException {
+        // TODO: this seems wrong, SearchPhaseResult should have a writeTo?
     }
 }

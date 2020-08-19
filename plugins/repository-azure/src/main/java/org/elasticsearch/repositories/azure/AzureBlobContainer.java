@@ -19,6 +19,7 @@
 
 package org.elasticsearch.repositories.azure;
 
+import com.microsoft.azure.storage.Constants;
 import com.microsoft.azure.storage.LocationMode;
 import com.microsoft.azure.storage.StorageException;
 import org.apache.logging.log4j.LogManager;
@@ -29,8 +30,9 @@ import org.elasticsearch.action.support.GroupedActionListener;
 import org.elasticsearch.action.support.PlainActionFuture;
 import org.elasticsearch.common.Nullable;
 import org.elasticsearch.common.blobstore.BlobContainer;
-import org.elasticsearch.common.blobstore.BlobMetaData;
+import org.elasticsearch.common.blobstore.BlobMetadata;
 import org.elasticsearch.common.blobstore.BlobPath;
+import org.elasticsearch.common.blobstore.DeleteResult;
 import org.elasticsearch.common.blobstore.support.AbstractBlobContainer;
 import org.elasticsearch.threadpool.ThreadPool;
 
@@ -39,8 +41,6 @@ import java.io.InputStream;
 import java.net.HttpURLConnection;
 import java.net.URISyntaxException;
 import java.nio.file.NoSuchFileException;
-import java.util.ArrayList;
-import java.util.Collection;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.ExecutorService;
@@ -70,10 +70,8 @@ public class AzureBlobContainer extends AbstractBlobContainer {
         return false;
     }
 
-    @Override
-    public InputStream readBlob(String blobName) throws IOException {
-        logger.trace("readBlob({})", blobName);
-
+    private InputStream openInputStream(String blobName, long position, @Nullable Long length) throws IOException {
+        logger.trace("readBlob({}) from position [{}] with length [{}]", blobName, position, length != null ? length : "unlimited");
         if (blobStore.getLocationMode() == LocationMode.SECONDARY_ONLY && !blobExists(blobName)) {
             // On Azure, if the location path is a secondary location, and the blob does not
             // exist, instead of returning immediately from the getInputStream call below
@@ -83,9 +81,8 @@ public class AzureBlobContainer extends AbstractBlobContainer {
             // stream to it.
             throw new NoSuchFileException("Blob [" + blobName + "] does not exist");
         }
-
         try {
-            return blobStore.getInputStream(buildKey(blobName));
+            return blobStore.getInputStream(buildKey(blobName), position, length);
         } catch (StorageException e) {
             if (e.getHttpStatusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
                 throw new NoSuchFileException(e.getMessage());
@@ -97,9 +94,23 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
+    public InputStream readBlob(String blobName) throws IOException {
+        return openInputStream(blobName, 0L, null);
+    }
+
+    @Override
+    public InputStream readBlob(String blobName, long position, long length) throws IOException {
+        return openInputStream(blobName, position, length);
+    }
+
+    @Override
+    public long readBlobPreferredLength() {
+        return Constants.DEFAULT_MINIMUM_READ_SIZE_IN_BYTES;
+    }
+
+    @Override
     public void writeBlob(String blobName, InputStream inputStream, long blobSize, boolean failIfAlreadyExists) throws IOException {
         logger.trace("writeBlob({}, stream, {})", buildKey(blobName), blobSize);
-
         try {
             blobStore.writeBlob(buildKey(blobName), inputStream, blobSize, failIfAlreadyExists);
         } catch (URISyntaxException|StorageException e) {
@@ -113,55 +124,40 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
-    public void deleteBlob(String blobName) throws IOException {
-        logger.trace("deleteBlob({})", blobName);
-
+    public DeleteResult delete() throws IOException {
         try {
-            blobStore.deleteBlob(buildKey(blobName));
-        } catch (StorageException e) {
-            if (e.getHttpStatusCode() == HttpURLConnection.HTTP_NOT_FOUND) {
-                throw new NoSuchFileException(e.getMessage());
-            }
+            return blobStore.deleteBlobDirectory(keyPath, threadPool.executor(AzureRepositoryPlugin.REPOSITORY_THREAD_POOL_NAME));
+        } catch (URISyntaxException | StorageException e) {
             throw new IOException(e);
-        } catch (URISyntaxException e) {
-            throw new IOException(e);
-        }
-    }
-
-    @Override
-    public void delete() throws IOException {
-        PlainActionFuture<Void> result = PlainActionFuture.newFuture();
-        asyncDelete(result);
-        try {
-            result.actionGet();
-        } catch (Exception e) {
-            throw new IOException("Exception during container delete", e);
-        }
-    }
-
-    private void asyncDelete(ActionListener<Void> listener) throws IOException {
-        final Collection<BlobContainer> childContainers = children().values();
-        if (childContainers.isEmpty() == false) {
-            final ActionListener<Void> childListener = new GroupedActionListener<>(
-                ActionListener.wrap(v -> asyncDeleteBlobsIgnoringIfNotExists(
-                    new ArrayList<>(listBlobs().keySet()), listener), listener::onFailure), childContainers.size());
-            for (BlobContainer container : childContainers) {
-                threadPool.executor(AzureRepositoryPlugin.REPOSITORY_THREAD_POOL_NAME).submit(new ActionRunnable<>(childListener) {
-                    @Override
-                    protected void doRun() throws Exception {
-                        ((AzureBlobContainer) container).asyncDelete(childListener);
-                    }
-                });
-            }
-        } else {
-            asyncDeleteBlobsIgnoringIfNotExists(new ArrayList<>(listBlobs().keySet()), listener);
         }
     }
 
     @Override
     public void deleteBlobsIgnoringIfNotExists(List<String> blobNames) throws IOException {
         final PlainActionFuture<Void> result = PlainActionFuture.newFuture();
-        asyncDeleteBlobsIgnoringIfNotExists(blobNames, result);
+        if (blobNames.isEmpty()) {
+            result.onResponse(null);
+        } else {
+            final GroupedActionListener<Void> listener =
+                new GroupedActionListener<>(ActionListener.map(result, v -> null), blobNames.size());
+            final ExecutorService executor = threadPool.executor(AzureRepositoryPlugin.REPOSITORY_THREAD_POOL_NAME);
+            // Executing deletes in parallel since Azure SDK 8 is using blocking IO while Azure does not provide a bulk delete API endpoint
+            // TODO: Upgrade to newer non-blocking Azure SDK 11 and execute delete requests in parallel that way.
+            for (String blobName : blobNames) {
+                executor.execute(ActionRunnable.run(listener, () -> {
+                    logger.trace("deleteBlob({})", blobName);
+                    try {
+                        blobStore.deleteBlob(buildKey(blobName));
+                    } catch (StorageException e) {
+                        if (e.getHttpStatusCode() != HttpURLConnection.HTTP_NOT_FOUND) {
+                            throw new IOException(e);
+                        }
+                    } catch (URISyntaxException e) {
+                        throw new IOException(e);
+                    }
+                }));
+            }
+        }
         try {
             result.actionGet();
         } catch (Exception e) {
@@ -169,29 +165,8 @@ public class AzureBlobContainer extends AbstractBlobContainer {
         }
     }
 
-    private void asyncDeleteBlobsIgnoringIfNotExists(List<String> blobNames, ActionListener<Void> callback) {
-        if (blobNames.isEmpty()) {
-            callback.onResponse(null);
-        } else {
-            final GroupedActionListener<Void> listener =
-                new GroupedActionListener<>(ActionListener.map(callback, v -> null), blobNames.size());
-            final ExecutorService executor = threadPool.executor(AzureRepositoryPlugin.REPOSITORY_THREAD_POOL_NAME);
-            // Executing deletes in parallel since Azure SDK 8 is using blocking IO while Azure does not provide a bulk delete API endpoint
-            // TODO: Upgrade to newer non-blocking Azure SDK 11 and execute delete requests in parallel that way.
-            for (String blobName : blobNames) {
-                executor.submit(new ActionRunnable<>(listener) {
-                    @Override
-                    protected void doRun() throws IOException {
-                        deleteBlobIgnoringIfNotExists(blobName);
-                        listener.onResponse(null);
-                    }
-                });
-            }
-        }
-    }
-
     @Override
-    public Map<String, BlobMetaData> listBlobsByPrefix(@Nullable String prefix) throws IOException {
+    public Map<String, BlobMetadata> listBlobsByPrefix(@Nullable String prefix) throws IOException {
         logger.trace("listBlobsByPrefix({})", prefix);
 
         try {
@@ -203,7 +178,7 @@ public class AzureBlobContainer extends AbstractBlobContainer {
     }
 
     @Override
-    public Map<String, BlobMetaData> listBlobs() throws IOException {
+    public Map<String, BlobMetadata> listBlobs() throws IOException {
         logger.trace("listBlobs()");
         return listBlobsByPrefix(null);
     }

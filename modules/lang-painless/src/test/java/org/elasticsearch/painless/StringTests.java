@@ -91,7 +91,7 @@ public class StringTests extends ScriptTestCase {
             result.append(s);
         }
         final String s = script.toString();
-        assertTrue("every string part should be separatly pushed to stack.",
+        assertTrue("every string part should be separately pushed to stack.",
                 Debugger.toString(s).contains(String.format(Locale.ROOT, "LDC \"%03d\"", count/2)));
         assertEquals(result.toString(), exec(s));
     }
@@ -167,12 +167,12 @@ public class StringTests extends ScriptTestCase {
         assertEquals('c', exec("String s = \"c\"; (char)s"));
         assertEquals('c', exec("String s = 'c'; (char)s"));
 
-        ClassCastException expected = expectScriptThrows(ClassCastException.class, false, () -> {
+        ClassCastException expected = expectScriptThrows(ClassCastException.class, () -> {
             assertEquals("cc", exec("return (String)(char)\"cc\""));
         });
         assertTrue(expected.getMessage().contains("cannot cast java.lang.String with length not equal to one to char"));
 
-        expected = expectScriptThrows(ClassCastException.class, false, () -> {
+        expected = expectScriptThrows(ClassCastException.class, () -> {
             assertEquals("cc", exec("return (String)(char)'cc'"));
         });
         assertTrue(expected.getMessage().contains("cannot cast java.lang.String with length not equal to one to char"));
@@ -251,11 +251,11 @@ public class StringTests extends ScriptTestCase {
         String rando = randomRealisticUnicodeOfLength(between(5, 1000));
         assertEquals(rando, exec("params.rando.encodeBase64().decodeBase64()", singletonMap("rando", rando), true));
     }
-    
+
     public void testJava9StringConcatBytecode() {
         assumeTrue("Needs Java 9 to test indified String concat", Constants.JRE_IS_MINIMUM_JAVA9);
         assertNotNull(WriterConstants.INDY_STRING_CONCAT_BOOTSTRAP_HANDLE);
-        assertBytecodeExists("String s = \"cat\"; return s + true + 'abc' + null;", 
+        assertBytecodeExists("String s = \"cat\"; return s + true + 'abc' + null;",
                 "INVOKEDYNAMIC concat(Ljava/lang/String;ZLjava/lang/String;Ljava/lang/Object;)Ljava/lang/String;");
     }
 }

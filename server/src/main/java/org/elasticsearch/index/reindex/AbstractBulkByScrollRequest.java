@@ -43,11 +43,6 @@ import static org.elasticsearch.common.unit.TimeValue.timeValueMinutes;
 public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScrollRequest<Self>> extends ActionRequest {
 
     public static final int MAX_DOCS_ALL_MATCHES = -1;
-    /**
-     * @deprecated please use MAX_DOCS_ALL_MATCHES instead.
-     */
-    @Deprecated
-    public static final int SIZE_ALL_MATCHES = MAX_DOCS_ALL_MATCHES;
     public static final TimeValue DEFAULT_SCROLL_TIMEOUT = timeValueMinutes(5);
     public static final int DEFAULT_SCROLL_SIZE = 1000;
 
@@ -114,10 +109,18 @@ public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScr
      */
     private int slices = DEFAULT_SLICES;
 
-    /**
-     * Constructor for deserialization.
-     */
-    public AbstractBulkByScrollRequest() {
+    public AbstractBulkByScrollRequest(StreamInput in) throws IOException {
+        super(in);
+        searchRequest = new SearchRequest(in);
+        abortOnVersionConflict = in.readBoolean();
+        maxDocs = in.readVInt();
+        refresh = in.readBoolean();
+        timeout = in.readTimeValue();
+        activeShardCount = ActiveShardCount.readFrom(in);
+        retryBackoffInitialTime = in.readTimeValue();
+        maxRetries = in.readVInt();
+        requestsPerSecond = in.readFloat();
+        slices = in.readVInt();
     }
 
     /**
@@ -171,27 +174,6 @@ public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScr
     /**
      * Maximum number of processed documents. Defaults to -1 meaning process all
      * documents.
-     * @deprecated please use getMaxDocs() instead.
-     */
-    @Deprecated
-    public int getSize() {
-        return getMaxDocs();
-    }
-
-    /**
-     * Maximum number of processed documents. Defaults to -1 meaning process all
-     * documents.
-     *
-     * @deprecated please use setMaxDocs(int) instead.
-     */
-    @Deprecated
-    public Self setSize(int size) {
-        return setMaxDocs(size);
-    }
-
-    /**
-     * Maximum number of processed documents. Defaults to -1 meaning process all
-     * documents.
      */
     public int getMaxDocs() {
         return maxDocs;
@@ -204,6 +186,9 @@ public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScr
     public Self setMaxDocs(int maxDocs) {
         if (maxDocs < 0) {
             throw new IllegalArgumentException("[max_docs] parameter cannot be negative, found [" + maxDocs + "]");
+        }
+        if (maxDocs < slices) {
+            throw new IllegalArgumentException("[max_docs] should be >= [slices]");
         }
         this.maxDocs = maxDocs;
         return self();
@@ -393,6 +378,7 @@ public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScr
 
     /**
      * The number of slices this task should be divided into. Defaults to 1 meaning the task isn't sliced into subtasks.
+     * A value of 0 is equivalent to the "auto" slices parameter of the Rest API.
      */
     public Self setSlices(int slices) {
         if (slices < 0) {
@@ -444,21 +430,6 @@ public abstract class AbstractBulkByScrollRequest<Self extends AbstractBulkByScr
     @Override
     public Task createTask(long id, String type, String action, TaskId parentTaskId, Map<String, String> headers) {
         return new BulkByScrollTask(id, type, action, getDescription(), parentTaskId, headers);
-    }
-
-    @Override
-    public void readFrom(StreamInput in) throws IOException {
-        super.readFrom(in);
-        searchRequest = new SearchRequest(in);
-        abortOnVersionConflict = in.readBoolean();
-        maxDocs = in.readVInt();
-        refresh = in.readBoolean();
-        timeout = in.readTimeValue();
-        activeShardCount = ActiveShardCount.readFrom(in);
-        retryBackoffInitialTime = in.readTimeValue();
-        maxRetries = in.readVInt();
-        requestsPerSecond = in.readFloat();
-        slices = in.readVInt();
     }
 
     @Override
