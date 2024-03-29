@@ -1,25 +1,31 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 
 package org.elasticsearch.xpack.core.ml.inference.trainedmodel.metadata;
 
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.ParseField;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
-import org.elasticsearch.common.xcontent.ConstructingObjectParser;
-import org.elasticsearch.common.xcontent.ToXContentObject;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.core.Nullable;
+import org.elasticsearch.xcontent.ConstructingObjectParser;
+import org.elasticsearch.xcontent.ObjectParser;
+import org.elasticsearch.xcontent.ParseField;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentParseException;
+import org.elasticsearch.xcontent.XContentParser;
 
 import java.io.IOException;
 import java.util.Collections;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
+import java.util.stream.Collectors;
 
 public class TotalFeatureImportance implements ToXContentObject, Writeable {
 
@@ -37,16 +43,22 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
 
     @SuppressWarnings("unchecked")
     private static ConstructingObjectParser<TotalFeatureImportance, Void> createParser(boolean ignoreUnknownFields) {
-        ConstructingObjectParser<TotalFeatureImportance, Void> parser = new ConstructingObjectParser<>(NAME,
+        ConstructingObjectParser<TotalFeatureImportance, Void> parser = new ConstructingObjectParser<>(
+            NAME,
             ignoreUnknownFields,
-            a -> new TotalFeatureImportance((String)a[0], (Importance)a[1], (List<ClassImportance>)a[2]));
+            a -> new TotalFeatureImportance((String) a[0], (Importance) a[1], (List<ClassImportance>) a[2])
+        );
         parser.declareString(ConstructingObjectParser.constructorArg(), FEATURE_NAME);
-        parser.declareObject(ConstructingObjectParser.optionalConstructorArg(),
+        parser.declareObject(
+            ConstructingObjectParser.optionalConstructorArg(),
             ignoreUnknownFields ? Importance.LENIENT_PARSER : Importance.STRICT_PARSER,
-            IMPORTANCE);
-        parser.declareObjectArray(ConstructingObjectParser.optionalConstructorArg(),
+            IMPORTANCE
+        );
+        parser.declareObjectArray(
+            ConstructingObjectParser.optionalConstructorArg(),
             ignoreUnknownFields ? ClassImportance.LENIENT_PARSER : ClassImportance.STRICT_PARSER,
-            CLASSES);
+            CLASSES
+        );
         return parser;
     }
 
@@ -61,7 +73,7 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
     public TotalFeatureImportance(StreamInput in) throws IOException {
         this.featureName = in.readString();
         this.importance = in.readOptionalWriteable(Importance::new);
-        this.classImportances = in.readList(ClassImportance::new);
+        this.classImportances = in.readCollectionAsList(ClassImportance::new);
     }
 
     TotalFeatureImportance(String featureName, @Nullable Importance importance, @Nullable List<ClassImportance> classImportances) {
@@ -74,21 +86,12 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
     public void writeTo(StreamOutput out) throws IOException {
         out.writeString(featureName);
         out.writeOptionalWriteable(importance);
-        out.writeList(classImportances);
+        out.writeCollection(classImportances);
     }
 
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-        builder.startObject();
-        builder.field(FEATURE_NAME.getPreferredName(), featureName);
-        if (importance != null) {
-            builder.field(IMPORTANCE.getPreferredName(), importance);
-        }
-        if (classImportances.isEmpty() == false) {
-            builder.field(CLASSES.getPreferredName(), classImportances);
-        }
-        builder.endObject();
-        return builder;
+        return builder.map(asMap());
     }
 
     @Override
@@ -99,6 +102,18 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
         return Objects.equals(that.importance, importance)
             && Objects.equals(featureName, that.featureName)
             && Objects.equals(classImportances, that.classImportances);
+    }
+
+    public Map<String, Object> asMap() {
+        Map<String, Object> map = new LinkedHashMap<>();
+        map.put(FEATURE_NAME.getPreferredName(), featureName);
+        if (importance != null) {
+            map.put(IMPORTANCE.getPreferredName(), importance.asMap());
+        }
+        if (classImportances.isEmpty() == false) {
+            map.put(CLASSES.getPreferredName(), classImportances.stream().map(ClassImportance::asMap).collect(Collectors.toList()));
+        }
+        return map;
     }
 
     @Override
@@ -114,9 +129,11 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
         public static final ConstructingObjectParser<Importance, Void> STRICT_PARSER = createParser(false);
 
         private static ConstructingObjectParser<Importance, Void> createParser(boolean ignoreUnknownFields) {
-            ConstructingObjectParser<Importance, Void> parser = new ConstructingObjectParser<>(NAME,
+            ConstructingObjectParser<Importance, Void> parser = new ConstructingObjectParser<>(
+                NAME,
                 ignoreUnknownFields,
-                a -> new Importance((double)a[0], (double)a[1], (double)a[2]));
+                a -> new Importance((double) a[0], (double) a[1], (double) a[2])
+            );
             parser.declareDouble(ConstructingObjectParser.constructorArg(), MEAN_MAGNITUDE);
             parser.declareDouble(ConstructingObjectParser.constructorArg(), MIN);
             parser.declareDouble(ConstructingObjectParser.constructorArg(), MAX);
@@ -144,9 +161,9 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Importance that = (Importance) o;
-            return Double.compare(that.meanMagnitude, meanMagnitude) == 0 &&
-                Double.compare(that.min, min) == 0 &&
-                Double.compare(that.max, max) == 0;
+            return Double.compare(that.meanMagnitude, meanMagnitude) == 0
+                && Double.compare(that.min, min) == 0
+                && Double.compare(that.max, max) == 0;
         }
 
         @Override
@@ -163,12 +180,15 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
 
         @Override
         public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-            builder.startObject();
-            builder.field(MEAN_MAGNITUDE.getPreferredName(), meanMagnitude);
-            builder.field(MIN.getPreferredName(), min);
-            builder.field(MAX.getPreferredName(), max);
-            builder.endObject();
-            return builder;
+            return builder.map(asMap());
+        }
+
+        private Map<String, Object> asMap() {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put(MEAN_MAGNITUDE.getPreferredName(), meanMagnitude);
+            map.put(MIN.getPreferredName(), min);
+            map.put(MAX.getPreferredName(), max);
+            return map;
         }
     }
 
@@ -183,13 +203,26 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
         public static final ConstructingObjectParser<ClassImportance, Void> STRICT_PARSER = createParser(false);
 
         private static ConstructingObjectParser<ClassImportance, Void> createParser(boolean ignoreUnknownFields) {
-            ConstructingObjectParser<ClassImportance, Void> parser = new ConstructingObjectParser<>(NAME,
+            ConstructingObjectParser<ClassImportance, Void> parser = new ConstructingObjectParser<>(
+                NAME,
                 ignoreUnknownFields,
-                a -> new ClassImportance((String)a[0], (Importance)a[1]));
-            parser.declareString(ConstructingObjectParser.constructorArg(), CLASS_NAME);
-            parser.declareObject(ConstructingObjectParser.constructorArg(),
+                a -> new ClassImportance(a[0], (Importance) a[1])
+            );
+            parser.declareField(ConstructingObjectParser.constructorArg(), (p, c) -> {
+                if (p.currentToken() == XContentParser.Token.VALUE_STRING) {
+                    return p.text();
+                } else if (p.currentToken() == XContentParser.Token.VALUE_NUMBER) {
+                    return p.numberValue();
+                } else if (p.currentToken() == XContentParser.Token.VALUE_BOOLEAN) {
+                    return p.booleanValue();
+                }
+                throw new XContentParseException("Unsupported token [" + p.currentToken() + "]");
+            }, CLASS_NAME, ObjectParser.ValueType.VALUE);
+            parser.declareObject(
+                ConstructingObjectParser.constructorArg(),
                 ignoreUnknownFields ? Importance.LENIENT_PARSER : Importance.STRICT_PARSER,
-                IMPORTANCE);
+                IMPORTANCE
+            );
             return parser;
         }
 
@@ -197,32 +230,35 @@ public class TotalFeatureImportance implements ToXContentObject, Writeable {
             return lenient ? LENIENT_PARSER.parse(parser, null) : STRICT_PARSER.parse(parser, null);
         }
 
-        public final String className;
+        public final Object className;
         public final Importance importance;
 
         public ClassImportance(StreamInput in) throws IOException {
-            this.className = in.readString();
+            this.className = in.readGenericValue();
             this.importance = new Importance(in);
         }
 
-        ClassImportance(String className, Importance importance) {
+        ClassImportance(Object className, Importance importance) {
             this.className = className;
             this.importance = importance;
         }
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeString(className);
+            out.writeGenericValue(className);
             importance.writeTo(out);
         }
 
         @Override
         public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
-            builder.startObject();
-            builder.field(CLASS_NAME.getPreferredName(), className);
-            builder.field(IMPORTANCE.getPreferredName(), importance);
-            builder.endObject();
-            return builder;
+            return builder.map(asMap());
+        }
+
+        private Map<String, Object> asMap() {
+            Map<String, Object> map = new LinkedHashMap<>();
+            map.put(CLASS_NAME.getPreferredName(), className);
+            map.put(IMPORTANCE.getPreferredName(), importance.asMap());
+            return map;
         }
 
         @Override

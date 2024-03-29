@@ -1,142 +1,61 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.search;
 
-import org.apache.logging.log4j.LogManager;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionFuture;
-import org.elasticsearch.action.admin.cluster.node.tasks.cancel.CancelTasksResponse;
-import org.elasticsearch.action.admin.cluster.node.tasks.list.ListTasksResponse;
-import org.elasticsearch.action.bulk.BulkRequestBuilder;
-import org.elasticsearch.action.search.SearchAction;
+import org.elasticsearch.action.search.MultiSearchResponse;
 import org.elasticsearch.action.search.SearchPhaseExecutionException;
 import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchScrollAction;
-import org.elasticsearch.action.support.WriteRequest;
+import org.elasticsearch.action.search.SearchShardTask;
+import org.elasticsearch.action.search.SearchTask;
+import org.elasticsearch.action.search.SearchTransportService;
+import org.elasticsearch.action.search.SearchType;
+import org.elasticsearch.action.search.ShardSearchFailure;
+import org.elasticsearch.action.search.TransportMultiSearchAction;
+import org.elasticsearch.action.search.TransportSearchAction;
+import org.elasticsearch.action.search.TransportSearchScrollAction;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.plugins.Plugin;
-import org.elasticsearch.plugins.PluginsService;
-import org.elasticsearch.script.MockScriptPlugin;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.script.Script;
 import org.elasticsearch.script.ScriptType;
-import org.elasticsearch.search.lookup.LeafFieldsLookup;
-import org.elasticsearch.tasks.TaskInfo;
+import org.elasticsearch.search.aggregations.bucket.terms.TermsAggregationBuilder;
+import org.elasticsearch.search.aggregations.metrics.ScriptedMetricAggregationBuilder;
+import org.elasticsearch.search.internal.ReaderContext;
+import org.elasticsearch.tasks.Task;
+import org.elasticsearch.tasks.TaskCancelledException;
+import org.elasticsearch.test.AbstractSearchCancellationTestCase;
 import org.elasticsearch.test.ESIntegTestCase;
+import org.elasticsearch.transport.TransportService;
 
 import java.util.ArrayList;
-import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
-import java.util.Map;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
-import java.util.concurrent.atomic.AtomicInteger;
-import java.util.function.Function;
 
+import static org.elasticsearch.index.query.QueryBuilders.matchAllQuery;
 import static org.elasticsearch.index.query.QueryBuilders.scriptQuery;
-import static org.elasticsearch.search.SearchCancellationIT.ScriptedBlockPlugin.SCRIPT_NAME;
-import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertNoFailures;
-import static org.hamcrest.Matchers.equalTo;
-import static org.hamcrest.Matchers.greaterThan;
+import static org.elasticsearch.test.AbstractSearchCancellationTestCase.ScriptedBlockPlugin.SEARCH_BLOCK_SCRIPT_NAME;
+import static org.elasticsearch.test.hamcrest.ElasticsearchAssertions.assertFailures;
+import static org.hamcrest.Matchers.containsString;
 import static org.hamcrest.Matchers.hasSize;
+import static org.hamcrest.Matchers.notNullValue;
 
-@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.SUITE)
-public class SearchCancellationIT extends ESIntegTestCase {
-
-    @Override
-    protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return Collections.singleton(ScriptedBlockPlugin.class);
-    }
+@ESIntegTestCase.ClusterScope(scope = ESIntegTestCase.Scope.TEST)
+public class SearchCancellationIT extends AbstractSearchCancellationTestCase {
 
     @Override
-    protected Settings nodeSettings(int nodeOrdinal) {
-        boolean lowLevelCancellation = randomBoolean();
-        logger.info("Using lowLevelCancellation: {}", lowLevelCancellation);
-        return Settings.builder()
-            .put(super.nodeSettings(nodeOrdinal))
-            .put(SearchService.LOW_LEVEL_CANCELLATION_SETTING.getKey(), lowLevelCancellation)
-            .build();
-    }
-
-    private void indexTestData() {
-        for (int i = 0; i < 5; i++) {
-            // Make sure we have a few segments
-            BulkRequestBuilder bulkRequestBuilder = client().prepareBulk().setRefreshPolicy(WriteRequest.RefreshPolicy.IMMEDIATE);
-            for (int j = 0; j < 20; j++) {
-                bulkRequestBuilder.add(client().prepareIndex("test").setId(Integer.toString(i * 5 + j)).setSource("field", "value"));
-            }
-            assertNoFailures(bulkRequestBuilder.get());
-        }
-    }
-
-    private List<ScriptedBlockPlugin> initBlockFactory() {
-        List<ScriptedBlockPlugin> plugins = new ArrayList<>();
-        for (PluginsService pluginsService : internalCluster().getDataNodeInstances(PluginsService.class)) {
-            plugins.addAll(pluginsService.filterPlugins(ScriptedBlockPlugin.class));
-        }
-        for (ScriptedBlockPlugin plugin : plugins) {
-            plugin.reset();
-            plugin.enableBlock();
-        }
-        return plugins;
-    }
-
-    private void awaitForBlock(List<ScriptedBlockPlugin> plugins) throws Exception {
-        int numberOfShards = getNumShards("test").numPrimaries;
-        assertBusy(() -> {
-            int numberOfBlockedPlugins = 0;
-            for (ScriptedBlockPlugin plugin : plugins) {
-                numberOfBlockedPlugins += plugin.hits.get();
-            }
-            logger.info("The plugin blocked on {} out of {} shards", numberOfBlockedPlugins, numberOfShards);
-            assertThat(numberOfBlockedPlugins, greaterThan(0));
-        });
-    }
-
-    private void disableBlocks(List<ScriptedBlockPlugin> plugins) throws Exception {
-        for (ScriptedBlockPlugin plugin : plugins) {
-            plugin.disableBlock();
-        }
-    }
-
-    private void cancelSearch(String action) {
-        ListTasksResponse listTasksResponse = client().admin().cluster().prepareListTasks().setActions(action).get();
-        assertThat(listTasksResponse.getTasks(), hasSize(1));
-        TaskInfo searchTask = listTasksResponse.getTasks().get(0);
-
-        logger.info("Cancelling search");
-        CancelTasksResponse cancelTasksResponse = client().admin().cluster().prepareCancelTasks().setTaskId(searchTask.getTaskId()).get();
-        assertThat(cancelTasksResponse.getTasks(), hasSize(1));
-        assertThat(cancelTasksResponse.getTasks().get(0).getTaskId(), equalTo(searchTask.getTaskId()));
-    }
-
-    private SearchResponse ensureSearchWasCancelled(ActionFuture<SearchResponse> searchResponse) {
-        try {
-            SearchResponse response = searchResponse.actionGet();
-            logger.info("Search response {}", response);
-            assertNotEquals("At least one shard should have failed", 0, response.getFailedShards());
-            return response;
-        } catch (SearchPhaseExecutionException ex) {
-            logger.info("All shards failed with", ex);
-            return null;
-        }
+    // TODO all tests need to be updated to work with concurrent search
+    protected boolean enableConcurrentSearch() {
+        return false;
     }
 
     public void testCancellationDuringQueryPhase() throws Exception {
@@ -145,15 +64,14 @@ public class SearchCancellationIT extends ESIntegTestCase {
         indexTestData();
 
         logger.info("Executing search");
-        ActionFuture<SearchResponse> searchResponse = client().prepareSearch("test").setQuery(
-            scriptQuery(new Script(
-                ScriptType.INLINE, "mockscript", SCRIPT_NAME, Collections.emptyMap())))
-            .execute();
+        ActionFuture<SearchResponse> searchResponse = prepareSearch("test").setQuery(
+            scriptQuery(new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap()))
+        ).execute();
 
         awaitForBlock(plugins);
-        cancelSearch(SearchAction.NAME);
+        cancelSearch(TransportSearchAction.TYPE.name());
         disableBlocks(plugins);
-        logger.info("Segments {}", Strings.toString(client().admin().indices().prepareSegments("test").get()));
+        logger.info("Segments {}", Strings.toString(indicesAdmin().prepareSegments("test").get()));
         ensureSearchWasCancelled(searchResponse);
     }
 
@@ -163,15 +81,59 @@ public class SearchCancellationIT extends ESIntegTestCase {
         indexTestData();
 
         logger.info("Executing search");
-        ActionFuture<SearchResponse> searchResponse = client().prepareSearch("test")
-            .addScriptField("test_field",
-                new Script(ScriptType.INLINE, "mockscript", SCRIPT_NAME, Collections.emptyMap())
-            ).execute();
+        ActionFuture<SearchResponse> searchResponse = prepareSearch("test").addScriptField(
+            "test_field",
+            new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap())
+        ).execute();
 
         awaitForBlock(plugins);
-        cancelSearch(SearchAction.NAME);
+        cancelSearch(TransportSearchAction.TYPE.name());
         disableBlocks(plugins);
-        logger.info("Segments {}", Strings.toString(client().admin().indices().prepareSegments("test").get()));
+        logger.info("Segments {}", Strings.toString(indicesAdmin().prepareSegments("test").get()));
+        ensureSearchWasCancelled(searchResponse);
+    }
+
+    public void testCancellationDuringAggregation() throws Exception {
+        List<ScriptedBlockPlugin> plugins = initBlockFactory();
+        // This test is only meaningful with at least 2 shards to trigger reduce
+        int numberOfShards = between(2, 5);
+        createIndex("test", numberOfShards, 0);
+        indexTestData();
+
+        logger.info("Executing search");
+        TermsAggregationBuilder termsAggregationBuilder = new TermsAggregationBuilder("test_agg");
+        if (randomBoolean()) {
+            termsAggregationBuilder.script(
+                new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.TERM_SCRIPT_NAME, Collections.emptyMap())
+            );
+        } else {
+            termsAggregationBuilder.field("field.keyword");
+        }
+
+        ActionFuture<SearchResponse> searchResponse = prepareSearch("test").setQuery(matchAllQuery())
+            .addAggregation(
+                termsAggregationBuilder.subAggregation(
+                    new ScriptedMetricAggregationBuilder("sub_agg").initScript(
+                        new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.INIT_SCRIPT_NAME, Collections.emptyMap())
+                    )
+                        .mapScript(new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.MAP_SCRIPT_NAME, Collections.emptyMap()))
+                        .combineScript(
+                            new Script(ScriptType.INLINE, "mockscript", ScriptedBlockPlugin.COMBINE_SCRIPT_NAME, Collections.emptyMap())
+                        )
+                        .reduceScript(
+                            new Script(
+                                ScriptType.INLINE,
+                                "mockscript",
+                                ScriptedBlockPlugin.REDUCE_BLOCK_SCRIPT_NAME,
+                                Collections.emptyMap()
+                            )
+                        )
+                )
+            )
+            .execute();
+        awaitForBlock(plugins);
+        cancelSearch(TransportSearchAction.TYPE.name());
+        disableBlocks(plugins);
         ensureSearchWasCancelled(searchResponse);
     }
 
@@ -181,16 +143,13 @@ public class SearchCancellationIT extends ESIntegTestCase {
         indexTestData();
 
         logger.info("Executing search");
-        ActionFuture<SearchResponse> searchResponse = client().prepareSearch("test")
-            .setScroll(TimeValue.timeValueSeconds(10))
+        ActionFuture<SearchResponse> searchResponse = prepareSearch("test").setScroll(TimeValue.timeValueSeconds(10))
             .setSize(5)
-            .setQuery(
-                scriptQuery(new Script(
-                    ScriptType.INLINE, "mockscript", SCRIPT_NAME, Collections.emptyMap())))
+            .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap())))
             .execute();
 
         awaitForBlock(plugins);
-        cancelSearch(SearchAction.NAME);
+        cancelSearch(TransportSearchAction.TYPE.name());
         disableBlocks(plugins);
         SearchResponse response = ensureSearchWasCancelled(searchResponse);
         if (response != null) {
@@ -199,7 +158,6 @@ public class SearchCancellationIT extends ESIntegTestCase {
             client().prepareClearScroll().addScrollId(response.getScrollId()).get();
         }
     }
-
 
     public void testCancellationOfScrollSearchesOnFollowupRequests() throws Exception {
 
@@ -211,29 +169,31 @@ public class SearchCancellationIT extends ESIntegTestCase {
 
         logger.info("Executing search");
         TimeValue keepAlive = TimeValue.timeValueSeconds(5);
-        SearchResponse searchResponse = client().prepareSearch("test")
-            .setScroll(keepAlive)
+        String scrollId;
+        SearchResponse searchResponse = prepareSearch("test").setScroll(keepAlive)
             .setSize(2)
-            .setQuery(
-                scriptQuery(new Script(
-                    ScriptType.INLINE, "mockscript", SCRIPT_NAME, Collections.emptyMap())))
+            .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap())))
             .get();
+        try {
+            assertNotNull(searchResponse.getScrollId());
 
-        assertNotNull(searchResponse.getScrollId());
+            // Enable block so the second request would block
+            for (ScriptedBlockPlugin plugin : plugins) {
+                plugin.reset();
+                plugin.enableBlock();
+            }
 
-        // Enable block so the second request would block
-        for (ScriptedBlockPlugin plugin : plugins) {
-            plugin.reset();
-            plugin.enableBlock();
+            scrollId = searchResponse.getScrollId();
+            logger.info("Executing scroll with id {}", scrollId);
+        } finally {
+            searchResponse.decRef();
         }
-
-        String scrollId = searchResponse.getScrollId();
-        logger.info("Executing scroll with id {}", scrollId);
         ActionFuture<SearchResponse> scrollResponse = client().prepareSearchScroll(searchResponse.getScrollId())
-            .setScroll(keepAlive).execute();
+            .setScroll(keepAlive)
+            .execute();
 
         awaitForBlock(plugins);
-        cancelSearch(SearchScrollAction.NAME);
+        cancelSearch(TransportSearchScrollAction.TYPE.name());
         disableBlocks(plugins);
 
         SearchResponse response = ensureSearchWasCancelled(scrollResponse);
@@ -245,39 +205,128 @@ public class SearchCancellationIT extends ESIntegTestCase {
         client().prepareClearScroll().addScrollId(scrollId).get();
     }
 
-
-    public static class ScriptedBlockPlugin extends MockScriptPlugin {
-        static final String SCRIPT_NAME = "search_block";
-
-        private final AtomicInteger hits = new AtomicInteger();
-
-        private final AtomicBoolean shouldBlock = new AtomicBoolean(true);
-
-        public void reset() {
-            hits.set(0);
-        }
-
-        public void disableBlock() {
-            shouldBlock.set(false);
-        }
-
-        public void enableBlock() {
-            shouldBlock.set(true);
-        }
-
-        @Override
-        public Map<String, Function<Map<String, Object>, Object>> pluginScripts() {
-            return Collections.singletonMap(SCRIPT_NAME, params -> {
-                LeafFieldsLookup fieldsLookup = (LeafFieldsLookup) params.get("_fields");
-                LogManager.getLogger(SearchCancellationIT.class).info("Blocking on the document {}", fieldsLookup.get("_id"));
-                hits.incrementAndGet();
-                try {
-                    assertBusy(() -> assertFalse(shouldBlock.get()));
-                } catch (Exception e) {
-                    throw new RuntimeException(e);
+    public void testCancelMultiSearch() throws Exception {
+        List<ScriptedBlockPlugin> plugins = initBlockFactory();
+        indexTestData();
+        ActionFuture<MultiSearchResponse> multiSearchResponse = client().prepareMultiSearch()
+            .add(
+                prepareSearch("test").addScriptField(
+                    "test_field",
+                    new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap())
+                )
+            )
+            .execute();
+        MultiSearchResponse response = null;
+        try {
+            awaitForBlock(plugins);
+            cancelSearch(TransportMultiSearchAction.TYPE.name());
+            disableBlocks(plugins);
+            response = multiSearchResponse.actionGet();
+            for (MultiSearchResponse.Item item : response) {
+                if (item.getFailure() != null) {
+                    assertThat(ExceptionsHelper.unwrap(item.getFailure(), TaskCancelledException.class), notNullValue());
+                } else {
+                    assertFailures(item.getResponse());
+                    for (ShardSearchFailure shardFailure : item.getResponse().getShardFailures()) {
+                        assertThat(ExceptionsHelper.unwrap(shardFailure.getCause(), TaskCancelledException.class), notNullValue());
+                    }
                 }
-                return true;
+            }
+        } finally {
+            if (response != null) response.decRef();
+        }
+    }
+
+    @AwaitsFix(bugUrl = "https://github.com/elastic/elasticsearch/issues/99929")
+    public void testCancelFailedSearchWhenPartialResultDisallowed() throws Exception {
+        // Have at least two nodes so that we have parallel execution of two request guaranteed even if max concurrent requests per node
+        // are limited to 1
+        internalCluster().ensureAtLeastNumDataNodes(2);
+        int numberOfShards = between(2, 5);
+        createIndex("test", numberOfShards, 0);
+        indexTestData();
+
+        // Define (but don't run) the search request, expecting a partial shard failure. We will run it later.
+        Thread searchThread = new Thread(() -> {
+            SearchPhaseExecutionException e = expectThrows(
+                SearchPhaseExecutionException.class,
+                prepareSearch("test").setSearchType(SearchType.QUERY_THEN_FETCH)
+                    .setQuery(scriptQuery(new Script(ScriptType.INLINE, "mockscript", SEARCH_BLOCK_SCRIPT_NAME, Collections.emptyMap())))
+                    .setAllowPartialSearchResults(false)
+                    .setSize(1000)
+            );
+            assertThat(e.getMessage(), containsString("Partial shards failure"));
+        });
+
+        // When the search request executes, block all shards except 1.
+        final List<SearchShardBlockingPlugin> searchShardBlockingPlugins = initSearchShardBlockingPlugin();
+        AtomicBoolean letOneShardProceed = new AtomicBoolean();
+        CountDownLatch shardTaskLatch = new CountDownLatch(1);
+        for (SearchShardBlockingPlugin plugin : searchShardBlockingPlugins) {
+            plugin.setRunOnNewReaderContext((ReaderContext c) -> {
+                if (letOneShardProceed.compareAndSet(false, true)) {
+                    // Let one shard continue.
+                } else {
+                    safeAwait(shardTaskLatch); // Block the other shards.
+                }
             });
         }
+
+        // For the shard that was allowed to proceed, have a single query-execution thread throw an exception.
+        final List<ScriptedBlockPlugin> plugins = initBlockFactory();
+        AtomicBoolean oneThreadWillError = new AtomicBoolean();
+        for (ScriptedBlockPlugin plugin : plugins) {
+            plugin.disableBlock();
+            plugin.setBeforeExecution(() -> {
+                if (oneThreadWillError.compareAndSet(false, true)) {
+                    throw new IllegalStateException("This will cancel the ContextIndexSearcher.search task");
+                }
+            });
+        }
+
+        // Now run the search request.
+        searchThread.start();
+
+        try {
+            assertBusy(() -> {
+                final List<SearchTask> coordinatorSearchTask = getCoordinatorSearchTasks();
+                assertThat("The Coordinator should have one SearchTask.", coordinatorSearchTask, hasSize(1));
+                assertTrue("The SearchTask should be cancelled.", coordinatorSearchTask.get(0).isCancelled());
+                for (var shardQueryTask : getShardQueryTasks()) {
+                    assertTrue("All SearchShardTasks should then be cancelled", shardQueryTask.isCancelled());
+                }
+            }, 30, TimeUnit.SECONDS);
+        } finally {
+            shardTaskLatch.countDown(); // unblock the shardTasks, allowing the test to conclude.
+            searchThread.join();
+            plugins.forEach(plugin -> plugin.setBeforeExecution(() -> {}));
+            searchShardBlockingPlugins.forEach(plugin -> plugin.setRunOnNewReaderContext((ReaderContext c) -> {}));
+        }
+    }
+
+    List<SearchTask> getCoordinatorSearchTasks() {
+        List<SearchTask> tasks = new ArrayList<>();
+        for (String nodeName : internalCluster().getNodeNames()) {
+            TransportService transportService = internalCluster().getInstance(TransportService.class, nodeName);
+            for (Task task : transportService.getTaskManager().getCancellableTasks().values()) {
+                if (task.getAction().equals(TransportSearchAction.TYPE.name())) {
+                    tasks.add((SearchTask) task);
+                }
+            }
+        }
+        return tasks;
+    }
+
+    List<SearchShardTask> getShardQueryTasks() {
+        List<SearchShardTask> tasks = new ArrayList<>();
+        for (String nodeName : internalCluster().getNodeNames()) {
+            TransportService transportService = internalCluster().getInstance(TransportService.class, nodeName);
+            for (Task task : transportService.getTaskManager().getCancellableTasks().values()) {
+                if (task.getAction().equals(SearchTransportService.QUERY_ACTION_NAME)) {
+                    tasks.add((SearchShardTask) task);
+                }
+            }
+        }
+        return tasks;
     }
 }

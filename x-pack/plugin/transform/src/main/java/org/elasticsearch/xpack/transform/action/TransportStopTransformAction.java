@@ -1,7 +1,8 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.transform.action;
 
@@ -9,42 +10,46 @@ import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.elasticsearch.ElasticsearchException;
 import org.elasticsearch.ElasticsearchStatusException;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.ResourceNotFoundException;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.ActionListenerResponseHandler;
 import org.elasticsearch.action.FailedNodeException;
 import org.elasticsearch.action.TaskOperationFailure;
 import org.elasticsearch.action.support.ActionFilters;
+import org.elasticsearch.action.support.GroupedActionListener;
 import org.elasticsearch.action.support.tasks.TransportTasksAction;
-import org.elasticsearch.client.Client;
+import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.collect.Tuple;
 import org.elasticsearch.common.inject.Inject;
 import org.elasticsearch.common.logging.LoggerMessageFormat;
-import org.elasticsearch.common.regex.Regex;
-import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.discovery.MasterNotDiscoveredException;
+import org.elasticsearch.index.IndexNotFoundException;
 import org.elasticsearch.persistent.PersistentTasksCustomMetadata;
 import org.elasticsearch.persistent.PersistentTasksCustomMetadata.PersistentTask;
 import org.elasticsearch.persistent.PersistentTasksService;
 import org.elasticsearch.rest.RestStatus;
+import org.elasticsearch.tasks.CancellableTask;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.threadpool.ThreadPool;
+import org.elasticsearch.transport.TransportResponseHandler;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.action.util.PageParams;
-import org.elasticsearch.xpack.core.transform.TransformField;
 import org.elasticsearch.xpack.core.transform.TransformMessages;
 import org.elasticsearch.xpack.core.transform.action.StopTransformAction;
 import org.elasticsearch.xpack.core.transform.action.StopTransformAction.Request;
 import org.elasticsearch.xpack.core.transform.action.StopTransformAction.Response;
 import org.elasticsearch.xpack.core.transform.transforms.TransformState;
-import org.elasticsearch.xpack.core.transform.transforms.TransformTaskParams;
 import org.elasticsearch.xpack.core.transform.transforms.TransformTaskState;
 import org.elasticsearch.xpack.transform.TransformServices;
 import org.elasticsearch.xpack.transform.persistence.TransformConfigManager;
+import org.elasticsearch.xpack.transform.transforms.TransformNodeAssignments;
+import org.elasticsearch.xpack.transform.transforms.TransformNodes;
 import org.elasticsearch.xpack.transform.transforms.TransformTask;
 
 import java.util.ArrayList;
@@ -53,11 +58,11 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.function.Predicate;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
-import static org.elasticsearch.xpack.core.transform.TransformMessages.CANNOT_STOP_FAILED_TRANSFORM;
+import static org.elasticsearch.xpack.core.transform.TransformMessages.CANNOT_STOP_MULTIPLE_FAILED_TRANSFORMS;
+import static org.elasticsearch.xpack.core.transform.TransformMessages.CANNOT_STOP_SINGLE_FAILED_TRANSFORM;
 
 public class TransportStopTransformAction extends TransportTasksAction<TransformTask, Request, Response, Response> {
 
@@ -77,29 +82,16 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
         TransformServices transformServices,
         Client client
     ) {
-        this(
+        super(
             StopTransformAction.NAME,
+            clusterService,
             transportService,
             actionFilters,
-            clusterService,
-            threadPool,
-            persistentTasksService,
-            transformServices,
-            client
+            Request::new,
+            Response::new,
+            Response::new,
+            EsExecutors.DIRECT_EXECUTOR_SERVICE
         );
-    }
-
-    protected TransportStopTransformAction(
-        String name,
-        TransportService transportService,
-        ActionFilters actionFilters,
-        ClusterService clusterService,
-        ThreadPool threadPool,
-        PersistentTasksService persistentTasksService,
-        TransformServices transformServices,
-        Client client
-    ) {
-        super(name, clusterService, transportService, actionFilters, Request::new, Response::new, Response::new, ThreadPool.Names.SAME);
         this.threadPool = threadPool;
         this.transformConfigManager = transformServices.getConfigManager();
         this.persistentTasksService = persistentTasksService;
@@ -121,42 +113,22 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
             }
             if (failedTasks.isEmpty() == false) {
                 String msg = failedTasks.size() == 1
-                    ? TransformMessages.getMessage(CANNOT_STOP_FAILED_TRANSFORM, failedTasks.get(0), failedReasons.get(0))
-                    : "Unable to stop transforms. The following transforms are in a failed state "
-                        + failedTasks
-                        + " with reasons "
-                        + failedReasons
-                        + ". Use force stop to stop the transforms.";
+                    ? TransformMessages.getMessage(CANNOT_STOP_SINGLE_FAILED_TRANSFORM, failedTasks.get(0), failedReasons.get(0))
+                    : TransformMessages.getMessage(
+                        CANNOT_STOP_MULTIPLE_FAILED_TRANSFORMS,
+                        String.join(", ", failedTasks),
+                        String.join(", ", failedReasons)
+                    );
                 throw new ElasticsearchStatusException(msg, RestStatus.CONFLICT);
             }
         }
-    }
-
-    static Tuple<Set<String>, Set<String>> findTasksWithoutConfig(ClusterState state, String transformId) {
-        PersistentTasksCustomMetadata tasks = state.metadata().custom(PersistentTasksCustomMetadata.TYPE);
-
-        Set<String> taskIds = new HashSet<>();
-        Set<String> executorNodes = new HashSet<>();
-
-        if (tasks != null) {
-            Predicate<PersistentTask<?>> taskMatcher = Strings.isAllOrWildcard(new String[] { transformId }) ? t -> true : t -> {
-                TransformTaskParams transformParams = (TransformTaskParams) t.getParams();
-                return Regex.simpleMatch(transformId, transformParams.getId());
-            };
-
-            for (PersistentTasksCustomMetadata.PersistentTask<?> pTask : tasks.findTasks(TransformField.TASK_NAME, taskMatcher)) {
-                executorNodes.add(pTask.getExecutorNode());
-                taskIds.add(pTask.getId());
-            }
-        }
-
-        return new Tuple<>(taskIds, executorNodes);
     }
 
     @Override
     protected void doExecute(Task task, Request request, ActionListener<Response> listener) {
         final ClusterState state = clusterService.state();
         final DiscoveryNodes nodes = state.nodes();
+
         if (nodes.isLocalNodeElectedMaster() == false) {
             // Delegates stop transform to elected master node so it becomes the coordinating node.
             if (nodes.getMasterNode() == null) {
@@ -166,10 +138,12 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
                     nodes.getMasterNode(),
                     actionName,
                     request,
-                    new ActionListenerResponseHandler<>(listener, Response::new)
+                    new ActionListenerResponseHandler<>(listener, Response::new, TransportResponseHandler.TRANSPORT_WORKER)
                 );
             }
         } else {
+            TransformNodes.warnIfNoTransformNodes(state);
+
             final ActionListener<Response> finalListener;
             if (request.waitForCompletion()) {
                 finalListener = waitForStopListener(request, listener);
@@ -180,28 +154,67 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
             transformConfigManager.expandTransformIds(
                 request.getId(),
                 new PageParams(0, 10_000),
+                request.getTimeout(),
                 request.isAllowNoMatch(),
                 ActionListener.wrap(hitsAndIds -> {
-                    validateTaskState(state, hitsAndIds.v2(), request.isForce());
-                    request.setExpandedIds(new HashSet<>(hitsAndIds.v2()));
-                    request.setNodes(TransformNodes.transformTaskNodes(hitsAndIds.v2(), state));
-                    super.doExecute(task, request, finalListener);
+                    validateTaskState(state, hitsAndIds.v2().v1(), request.isForce());
+                    request.setExpandedIds(new HashSet<>(hitsAndIds.v2().v1()));
+                    final TransformNodeAssignments transformNodeAssignments = TransformNodes.transformTaskNodes(
+                        hitsAndIds.v2().v1(),
+                        state
+                    );
+
+                    final ActionListener<Response> doExecuteListener;
+                    if (transformNodeAssignments.getWaitingForAssignment().size() > 0) {
+                        doExecuteListener = cancelTransformTasksWithNoAssignment(finalListener, transformNodeAssignments);
+                    } else {
+                        doExecuteListener = finalListener;
+                    }
+
+                    if (transformNodeAssignments.getExecutorNodes().size() > 0) {
+                        request.setNodes(transformNodeAssignments.getExecutorNodes().toArray(new String[0]));
+                        super.doExecute(task, request, doExecuteListener);
+                    } else {
+                        doExecuteListener.onResponse(new Response(true));
+                    }
                 }, e -> {
                     if (e instanceof ResourceNotFoundException) {
-                        Tuple<Set<String>, Set<String>> runningTasksAndNodes = findTasksWithoutConfig(state, request.getId());
-                        if (runningTasksAndNodes.v1().isEmpty()) {
+                        final TransformNodeAssignments transformNodeAssignments = TransformNodes.findPersistentTasks(
+                            request.getId(),
+                            state
+                        );
+
+                        if (transformNodeAssignments.getAssigned().isEmpty()
+                            && transformNodeAssignments.getWaitingForAssignment().isEmpty()) {
                             listener.onFailure(e);
                             // found transforms without a config
                         } else if (request.isForce()) {
-                            request.setExpandedIds(runningTasksAndNodes.v1());
-                            request.setNodes(runningTasksAndNodes.v2().toArray(new String[0]));
-                            super.doExecute(task, request, finalListener);
+                            final ActionListener<Response> doExecuteListener;
+
+                            if (transformNodeAssignments.getWaitingForAssignment().size() > 0) {
+                                doExecuteListener = cancelTransformTasksWithNoAssignment(finalListener, transformNodeAssignments);
+                            } else {
+                                doExecuteListener = finalListener;
+                            }
+
+                            if (transformNodeAssignments.getExecutorNodes().size() > 0) {
+                                request.setExpandedIds(transformNodeAssignments.getAssigned());
+                                request.setNodes(transformNodeAssignments.getExecutorNodes().toArray(new String[0]));
+                                super.doExecute(task, request, doExecuteListener);
+                            } else {
+                                doExecuteListener.onResponse(new Response(true));
+                            }
                         } else {
+                            Set<String> transformsWithoutConfig = Stream.concat(
+                                transformNodeAssignments.getAssigned().stream(),
+                                transformNodeAssignments.getWaitingForAssignment().stream()
+                            ).collect(Collectors.toSet());
+
                             listener.onFailure(
                                 new ElasticsearchStatusException(
                                     TransformMessages.getMessage(
                                         TransformMessages.REST_STOP_TRANSFORM_WITHOUT_CONFIG,
-                                        Strings.arrayToCommaDelimitedString(runningTasksAndNodes.v1().toArray(new String[0]))
+                                        Strings.collectionToCommaDelimitedString(transformsWithoutConfig)
                                     ),
                                     RestStatus.CONFLICT
                                 )
@@ -216,7 +229,12 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
     }
 
     @Override
-    protected void taskOperation(Request request, TransformTask transformTask, ActionListener<Response> listener) {
+    protected void taskOperation(
+        CancellableTask actionTask,
+        Request request,
+        TransformTask transformTask,
+        ActionListener<Response> listener
+    ) {
 
         Set<String> ids = request.getExpandedIds();
         if (ids == null) {
@@ -225,24 +243,43 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
         }
 
         if (ids.contains(transformTask.getTransformId())) {
-            transformTask.setShouldStopAtCheckpoint(request.isWaitForCheckpoint(), ActionListener.wrap(r -> {
+            if (request.isForce()) {
+                // If force==true, we skip the additional step (setShouldStopAtCheckpoint) and move directly to shutting down the task.
+                // This way we ensure that the persistent task is removed ASAP (as opposed to being removed in one of the listeners).
                 try {
-                    transformTask.stop(request.isForce(), request.isWaitForCheckpoint());
+                    // Here the task is deregistered in scheduler and marked as completed in persistent task service.
+                    transformTask.shutdown();
+                    // Here the indexer is aborted so that its thread finishes work ASAP.
+                    transformTask.onCancelled();
                     listener.onResponse(new Response(true));
                 } catch (ElasticsearchException ex) {
                     listener.onFailure(ex);
                 }
-            },
-                e -> listener.onFailure(
-                    new ElasticsearchStatusException(
-                        "Failed to update transform task [{}] state value should_stop_at_checkpoint from [{}] to [{}]",
-                        RestStatus.CONFLICT,
-                        transformTask.getTransformId(),
-                        transformTask.getState().shouldStopAtNextCheckpoint(),
-                        request.isWaitForCheckpoint()
-                    )
-                )
-            ));
+                return;
+            }
+            // move the call to the generic thread pool, so we do not block the network thread
+            threadPool.generic().execute(() -> {
+                transformTask.setShouldStopAtCheckpoint(request.isWaitForCheckpoint(), ActionListener.wrap(r -> {
+                    try {
+                        transformTask.stop(request.isForce(), request.isWaitForCheckpoint());
+                        listener.onResponse(new Response(true));
+                    } catch (ElasticsearchException ex) {
+                        listener.onFailure(ex);
+                    }
+                }, e -> {
+                    logger.debug("failure setting should_stop_at_checkpoint", e);
+                    listener.onFailure(
+                        new ElasticsearchStatusException(
+                            "Failed to update transform task [{}] state value should_stop_at_checkpoint from [{}] to [{}]",
+                            RestStatus.CONFLICT,
+                            e,
+                            transformTask.getTransformId(),
+                            transformTask.getState().shouldStopAtNextCheckpoint(),
+                            request.isWaitForCheckpoint()
+                        )
+                    );
+                }));
+            });
         } else {
             listener.onFailure(
                 new RuntimeException(
@@ -272,29 +309,32 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
 
         ActionListener<Response> onStopListener = ActionListener.wrap(
             waitResponse -> transformConfigManager.refresh(ActionListener.wrap(r -> listener.onResponse(waitResponse), e -> {
-                logger.warn("Could not refresh state, state information might be outdated", e);
+                if ((ExceptionsHelper.unwrapCause(e) instanceof IndexNotFoundException) == false) {
+                    logger.warn("Could not refresh state, state information might be outdated", e);
+                }
                 listener.onResponse(waitResponse);
             })),
             listener::onFailure
         );
-        return ActionListener.wrap(
-            response -> {
-                // If there were failures attempting to stop the tasks, we don't know if they will actually stop.
-                // It is better to respond to the user now than allow for the persistent task waiting to timeout
-                if (response.getTaskFailures().isEmpty() == false || response.getNodeFailures().isEmpty() == false) {
-                    RestStatus status = firstNotOKStatus(response.getTaskFailures(), response.getNodeFailures());
-                    listener.onFailure(buildException(response.getTaskFailures(), response.getNodeFailures(), status));
-                    return;
-                }
-                // Wait until the persistent task is stopped
-                // Switch over to Generic threadpool so we don't block the network thread
-                threadPool.generic()
-                    .execute(
-                        () -> waitForTransformStopped(request.getExpandedIds(), request.getTimeout(), request.isForce(), onStopListener)
-                    );
-            },
-            listener::onFailure
-        );
+        return ActionListener.wrap(response -> {
+            // If there were failures attempting to stop the tasks, we don't know if they will actually stop.
+            // It is better to respond to the user now than allow for the persistent task waiting to timeout
+            if (response.getTaskFailures().isEmpty() == false || response.getNodeFailures().isEmpty() == false) {
+                logger.debug(
+                    "[{}] Failure when waiting for transform to stop, task failures: [{}], node failures: [{}]",
+                    request.getId(),
+                    response.getTaskFailures(),
+                    response.getNodeFailures()
+                );
+                RestStatus status = firstNotOKStatus(response.getTaskFailures(), response.getNodeFailures());
+                listener.onFailure(buildException(response.getTaskFailures(), response.getNodeFailures(), status));
+                return;
+            }
+            // Wait until the persistent task is stopped
+            // Switch over to Generic threadpool so we don't block the network thread
+            threadPool.generic()
+                .execute(() -> waitForTransformStopped(request.getExpandedIds(), request.getTimeout(), request.isForce(), onStopListener));
+        }, listener::onFailure);
     }
 
     static ElasticsearchStatusException buildException(
@@ -305,7 +345,10 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
         List<Exception> exceptions = Stream.concat(
             taskOperationFailures.stream().map(TaskOperationFailure::getCause),
             elasticsearchExceptions.stream()
-        ).collect(Collectors.toList());
+        ).toList();
+
+        assert exceptions.size() > 0 : "buildException called, but no exception found";
+        assert exceptions.get(0) != null : "exception must not be null";
 
         ElasticsearchStatusException elasticsearchStatusException = new ElasticsearchStatusException(
             exceptions.get(0).getMessage(),
@@ -367,7 +410,7 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
                     exceptions.put(
                         persistentTaskId,
                         new ElasticsearchStatusException(
-                            TransformMessages.getMessage(CANNOT_STOP_FAILED_TRANSFORM, persistentTaskId, taskState.getReason()),
+                            TransformMessages.getMessage(CANNOT_STOP_SINGLE_FAILED_TRANSFORM, persistentTaskId, taskState.getReason()),
                             RestStatus.CONFLICT
                         )
                     );
@@ -456,5 +499,36 @@ public class TransportStopTransformAction extends TransportTasksAction<Transform
             }
             listener.onFailure(e);
         }));
+    }
+
+    private ActionListener<Response> cancelTransformTasksWithNoAssignment(
+        final ActionListener<Response> finalListener,
+        final TransformNodeAssignments transformNodeAssignments
+    ) {
+        final ActionListener<Response> doExecuteListener = ActionListener.wrap(response -> {
+            GroupedActionListener<PersistentTask<?>> groupedListener = new GroupedActionListener<>(
+                transformNodeAssignments.getWaitingForAssignment().size(),
+                ActionListener.wrap(r -> {
+                    finalListener.onResponse(response);
+                }, finalListener::onFailure)
+            );
+
+            for (String unassignedTaskId : transformNodeAssignments.getWaitingForAssignment()) {
+                persistentTasksService.sendRemoveRequest(unassignedTaskId, null, groupedListener);
+            }
+
+        }, e -> {
+            GroupedActionListener<PersistentTask<?>> groupedListener = new GroupedActionListener<>(
+                transformNodeAssignments.getWaitingForAssignment().size(),
+                ActionListener.wrap(r -> {
+                    finalListener.onFailure(e);
+                }, finalListener::onFailure)
+            );
+
+            for (String unassignedTaskId : transformNodeAssignments.getWaitingForAssignment()) {
+                persistentTasksService.sendRemoveRequest(unassignedTaskId, null, groupedListener);
+            }
+        });
+        return doExecuteListener;
     }
 }

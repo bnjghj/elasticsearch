@@ -1,28 +1,22 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.license;
 
+import org.elasticsearch.action.support.master.AcknowledgedRequest;
 import org.elasticsearch.action.support.master.AcknowledgedRequestBuilder;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
-import org.elasticsearch.client.ElasticsearchClient;
-import org.elasticsearch.protocol.xpack.license.DeleteLicenseRequest;
+import org.elasticsearch.client.internal.ElasticsearchClient;
 
-public class DeleteLicenseRequestBuilder extends AcknowledgedRequestBuilder<DeleteLicenseRequest, AcknowledgedResponse,
-        DeleteLicenseRequestBuilder> {
+public class DeleteLicenseRequestBuilder extends AcknowledgedRequestBuilder<
+    AcknowledgedRequest.Plain,
+    AcknowledgedResponse,
+    DeleteLicenseRequestBuilder> {
 
     public DeleteLicenseRequestBuilder(ElasticsearchClient client) {
-        this(client, DeleteLicenseAction.INSTANCE);
-    }
-
-    /**
-     * Creates new get licenses request builder
-     *
-     * @param client elasticsearch client
-     */
-    public DeleteLicenseRequestBuilder(ElasticsearchClient client, DeleteLicenseAction action) {
-        super(client, action, new DeleteLicenseRequest());
+        super(client, TransportDeleteLicenseAction.TYPE, new AcknowledgedRequest.Plain());
     }
 }

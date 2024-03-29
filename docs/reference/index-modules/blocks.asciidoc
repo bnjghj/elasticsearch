@@ -17,6 +17,7 @@ block.
 The following _dynamic_ index settings determine the blocks present on an
 index:
 
+[[index-blocks-read-only]]
 `index.blocks.read_only`::
 
     Set to `true` to make the index and index metadata read only, `false` to
@@ -24,13 +25,25 @@ index:
 
 `index.blocks.read_only_allow_delete`::
 
-    Similar to `index.blocks.read_only`, but also allows deleting the index to
-    make more resources available. The <<disk-based-shard-allocation,disk-based shard
-    allocator>> may add and remove this block automatically.
+    Similar to `index.blocks.write`, except that you can delete the index when
+    this block is in place. Do not set or remove this block yourself. The
+    <<disk-based-shard-allocation,disk-based shard allocator>> sets and removes
+    this block automatically according to the available disk space.
 +
-Deleting documents from an index to release resources - rather than deleting the index itself - can increase the index size over time. When `index.blocks.read_only_allow_delete` is set to `true`, deleting documents is not permitted. However, deleting the index itself releases the read-only index block and makes resources available almost immediately.
+Deleting documents from an index to release resources - rather than deleting
+the index itself - increases the index size temporarily, and therefore may not
+be possible when nodes are low on disk space. When
+`index.blocks.read_only_allow_delete` is set to `true`, deleting documents is
+not permitted. However, deleting the index entirely requires very little extra
+disk space and frees up the disk space consumed by the index almost immediately
+so this is still permitted.
 +
-IMPORTANT: {es} adds and removes the read-only index block automatically when the disk utilization falls below the high watermark, controlled by <<cluster-routing-flood-stage,cluster.routing.allocation.disk.watermark.flood_stage>>.
+IMPORTANT: {es} adds the read-only-allow-delete index block automatically when
+the disk utilization exceeds the flood stage watermark, and removes this block
+automatically when the disk utilization falls under the high watermark. See
+<<disk-based-shard-allocation,Disk-based shard allocation>> for more
+information about watermarks, and <<fix-watermark-errors,Fix watermark errors>>
+for help with resolving watermark issues.
 
 `index.blocks.read`::
 
@@ -38,33 +51,14 @@ IMPORTANT: {es} adds and removes the read-only index block automatically when th
 
 `index.blocks.write`::
 
-    Set to `true` to disable data write operations against the index. Unlike `read_only`,
-    this setting does not affect metadata. For instance, you can close an index with a `write`
-    block, but you cannot close an index with a `read_only` block.
+    Set to `true` to disable data write operations against the index. Unlike
+    `read_only`, this setting does not affect metadata. For instance, you can
+    adjust the settings of an index with a `write` block, but you cannot adjust
+    the settings of an index with a `read_only` block.
 
 `index.blocks.metadata`::
 
     Set to `true` to disable index metadata reads and writes.
-
-`index.blocks.read_only_allow_delete`::
-
-    Similar to `index.blocks.read_only`, but also allows deleting the index to
-    make more resources available. The <<disk-based-shard-allocation,disk-based shard
-    allocator>> adds and removes this block automatically.
-
-Deleting documents from an index - rather than deleting the index itself - can
-in fact increase the index size. When you are running out of disk space
-`index.blocks.read_only_allow_delete` is set to `true`, preventing you from
-consuming more disk space by deleting some documents. However, this block does
-permit you to delete the index itself since this does not require any extra
-disk space. When you delete an index the data is removed from disk almost
-immediately, freeing the space it consumes.
-
-IMPORTANT: {es} adds the read-only-allow-delete index block automatically when
-disk utilisation exceeds the <<cluster-routing-flood-stage,flood-stage
-watermark>> and removes it again when disk utilisation is below the
-<<cluster-routing-watermark-high,high watermark>>. You should not apply this
-block yourself.
 
 [discrete]
 [[add-index-block]]
@@ -93,9 +87,9 @@ PUT /my-index-000001/_block/write
 
 include::{es-repo-dir}/rest-api/common-parms.asciidoc[tag=index]
 +
-To add blocks to all indices, use `_all` or `*`. To disallow the adding
-of blocks to indices with `_all` or wildcard expressions,
-change the `action.destructive_requires_name` cluster setting to `true`.
+By default, you must explicitly name the indices you are adding blocks to.
+To allow the adding of blocks to indices with `_all`, `*`, or other wildcard
+expressions, change the `action.destructive_requires_name` setting to `false`.
 You can update this setting in the `elasticsearch.yml` file
 or using the <<cluster-update-settings,cluster update settings>> API.
 `<block>`::

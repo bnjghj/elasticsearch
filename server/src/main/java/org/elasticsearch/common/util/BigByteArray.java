@@ -1,31 +1,26 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.common.util;
 
 import org.apache.lucene.util.ArrayUtil;
 import org.apache.lucene.util.BytesRef;
+import org.apache.lucene.util.BytesRefIterator;
 import org.apache.lucene.util.RamUsageEstimator;
+import org.elasticsearch.common.io.stream.StreamInput;
+import org.elasticsearch.common.io.stream.StreamOutput;
 
+import java.io.IOException;
 import java.util.Arrays;
 
+import static org.elasticsearch.common.util.BigLongArray.writePages;
 import static org.elasticsearch.common.util.PageCacheRecycler.BYTE_PAGE_SIZE;
+import static org.elasticsearch.common.util.PageCacheRecycler.PAGE_SIZE_IN_BYTES;
 
 /**
  * Byte array abstraction able to support more than 2B values. This implementation slices data into fixed-sized blocks of
@@ -48,6 +43,11 @@ final class BigByteArray extends AbstractBigArray implements ByteArray {
     }
 
     @Override
+    public void writeTo(StreamOutput out) throws IOException {
+        writePages(out, size, pages, Byte.BYTES);
+    }
+
+    @Override
     public byte get(long index) {
         final int pageIndex = pageIndex(index);
         final int indexInPage = indexInPage(index);
@@ -67,6 +67,10 @@ final class BigByteArray extends AbstractBigArray implements ByteArray {
     @Override
     public boolean get(long index, int len, BytesRef ref) {
         assert index + len <= size();
+        if (len == 0) {
+            ref.length = 0;
+            return false;
+        }
         int pageIndex = pageIndex(index);
         final int indexInPage = indexInPage(index);
         if (indexInPage + len <= pageSize()) {
@@ -125,6 +129,44 @@ final class BigByteArray extends AbstractBigArray implements ByteArray {
             }
             Arrays.fill(pages[toPage], 0, indexInPage(toIndex - 1) + 1, value);
         }
+    }
+
+    @Override
+    public boolean hasArray() {
+        return false;
+    }
+
+    @Override
+    public byte[] array() {
+        assert false;
+        throw new UnsupportedOperationException();
+    }
+
+    @Override
+    public BytesRefIterator iterator() {
+        return new BytesRefIterator() {
+            int i = 0;
+            long remained = size;
+
+            @Override
+            public BytesRef next() {
+                if (remained == 0) {
+                    return null;
+                }
+                byte[] page = pages[i++];
+                int len = Math.toIntExact(Math.min(page.length, remained));
+                remained -= len;
+                return new BytesRef(page, 0, len);
+            }
+        };
+    }
+
+    @Override
+    public void fillWith(StreamInput in) throws IOException {
+        for (int i = 0; i < pages.length - 1; i++) {
+            in.readBytes(pages[i], 0, PAGE_SIZE_IN_BYTES);
+        }
+        in.readBytes(pages[pages.length - 1], 0, Math.toIntExact(size - (pages.length - 1L) * PAGE_SIZE_IN_BYTES));
     }
 
     @Override

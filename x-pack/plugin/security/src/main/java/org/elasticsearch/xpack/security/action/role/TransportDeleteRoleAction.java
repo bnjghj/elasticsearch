@@ -1,16 +1,17 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.security.action.role;
 
-import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.apache.logging.log4j.util.Supplier;
 import org.elasticsearch.action.ActionListener;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.HandledTransportAction;
 import org.elasticsearch.common.inject.Inject;
+import org.elasticsearch.common.util.concurrent.EsExecutors;
 import org.elasticsearch.tasks.Task;
 import org.elasticsearch.transport.TransportService;
 import org.elasticsearch.xpack.core.security.action.role.DeleteRoleAction;
@@ -25,7 +26,7 @@ public class TransportDeleteRoleAction extends HandledTransportAction<DeleteRole
 
     @Inject
     public TransportDeleteRoleAction(ActionFilters actionFilters, NativeRolesStore rolesStore, TransportService transportService) {
-        super(DeleteRoleAction.NAME, transportService, actionFilters, DeleteRoleRequest::new);
+        super(DeleteRoleAction.NAME, transportService, actionFilters, DeleteRoleRequest::new, EsExecutors.DIRECT_EXECUTOR_SERVICE);
         this.rolesStore = rolesStore;
     }
 
@@ -37,19 +38,9 @@ public class TransportDeleteRoleAction extends HandledTransportAction<DeleteRole
         }
 
         try {
-            rolesStore.deleteRole(request, new ActionListener<Boolean>() {
-                @Override
-                public void onResponse(Boolean found) {
-                    listener.onResponse(new DeleteRoleResponse(found));
-                }
-
-                @Override
-                public void onFailure(Exception t) {
-                    listener.onFailure(t);
-                }
-            });
+            rolesStore.deleteRole(request, listener.safeMap(DeleteRoleResponse::new));
         } catch (Exception e) {
-            logger.error((Supplier<?>) () -> new ParameterizedMessage("failed to delete role [{}]", request.name()), e);
+            logger.error((Supplier<?>) () -> "failed to delete role [" + request.name() + "]", e);
             listener.onFailure(e);
         }
     }

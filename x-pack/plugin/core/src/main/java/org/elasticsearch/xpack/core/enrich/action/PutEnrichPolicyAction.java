@@ -1,18 +1,18 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.core.enrich.action;
 
-import org.elasticsearch.Version;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
 import org.elasticsearch.action.support.master.MasterNodeRequest;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xpack.core.enrich.EnrichPolicy;
 
 import java.io.IOException;
@@ -24,7 +24,7 @@ public class PutEnrichPolicyAction extends ActionType<AcknowledgedResponse> {
     public static final String NAME = "cluster:admin/xpack/enrich/put";
 
     private PutEnrichPolicyAction() {
-        super(NAME, AcknowledgedResponse::new);
+        super(NAME);
     }
 
     public static Request fromXContent(XContentParser parser, String name) throws IOException {
@@ -38,10 +38,6 @@ public class PutEnrichPolicyAction extends ActionType<AcknowledgedResponse> {
 
         public Request(String name, EnrichPolicy policy) {
             this.name = Objects.requireNonNull(name, "name cannot be null");
-            if (!Version.CURRENT.equals(policy.getElasticsearchVersion())) {
-                throw new IllegalArgumentException("Cannot set [version_created] field on enrich policy [" + name +
-                    "]. Found [" + policy.getElasticsearchVersion() + "]");
-            }
             this.policy = policy;
         }
 
@@ -76,8 +72,7 @@ public class PutEnrichPolicyAction extends ActionType<AcknowledgedResponse> {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Request request = (Request) o;
-            return policy.equals(request.policy) &&
-                name.equals(request.name);
+            return policy.equals(request.policy) && name.equals(request.name);
         }
 
         @Override

@@ -1,7 +1,8 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.core.enrich.action;
 
@@ -12,10 +13,10 @@ import org.elasticsearch.action.support.master.MasterNodeRequest;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.io.stream.Writeable;
-import org.elasticsearch.common.xcontent.ToXContentFragment;
-import org.elasticsearch.common.xcontent.ToXContentObject;
-import org.elasticsearch.common.xcontent.XContentBuilder;
 import org.elasticsearch.tasks.TaskInfo;
+import org.elasticsearch.xcontent.ToXContentFragment;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
 
 import java.io.IOException;
 import java.util.List;
@@ -27,13 +28,12 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
     public static final String NAME = "cluster:monitor/xpack/enrich/stats";
 
     private EnrichStatsAction() {
-        super(NAME, Response::new);
+        super(NAME);
     }
 
     public static class Request extends MasterNodeRequest<Request> {
 
-        public Request() {
-        }
+        public Request() {}
 
         public Request(StreamInput in) throws IOException {
             super(in);
@@ -49,16 +49,19 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
 
         private final List<ExecutingPolicy> executingPolicies;
         private final List<CoordinatorStats> coordinatorStats;
+        private final List<CacheStats> cacheStats;
 
-        public Response(List<ExecutingPolicy> executingPolicies, List<CoordinatorStats> coordinatorStats) {
+        public Response(List<ExecutingPolicy> executingPolicies, List<CoordinatorStats> coordinatorStats, List<CacheStats> cacheStats) {
             this.executingPolicies = executingPolicies;
             this.coordinatorStats = coordinatorStats;
+            this.cacheStats = cacheStats;
         }
 
         public Response(StreamInput in) throws IOException {
             super(in);
-            executingPolicies = in.readList(ExecutingPolicy::new);
-            coordinatorStats = in.readList(CoordinatorStats::new);
+            executingPolicies = in.readCollectionAsList(ExecutingPolicy::new);
+            coordinatorStats = in.readCollectionAsList(CoordinatorStats::new);
+            cacheStats = in.readCollectionAsList(CacheStats::new);
         }
 
         public List<ExecutingPolicy> getExecutingPolicies() {
@@ -69,10 +72,15 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
             return coordinatorStats;
         }
 
+        public List<CacheStats> getCacheStats() {
+            return cacheStats;
+        }
+
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeList(executingPolicies);
-            out.writeList(coordinatorStats);
+            out.writeCollection(executingPolicies);
+            out.writeCollection(coordinatorStats);
+            out.writeCollection(cacheStats);
         }
 
         @Override
@@ -92,6 +100,15 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
                 builder.endObject();
             }
             builder.endArray();
+            if (cacheStats != null) {
+                builder.startArray("cache_stats");
+                for (CacheStats cacheStat : cacheStats) {
+                    builder.startObject();
+                    cacheStat.toXContent(builder, params);
+                    builder.endObject();
+                }
+                builder.endArray();
+            }
             builder.endObject();
             return builder;
         }
@@ -101,13 +118,14 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
             if (this == o) return true;
             if (o == null || getClass() != o.getClass()) return false;
             Response response = (Response) o;
-            return executingPolicies.equals(response.executingPolicies) &&
-                coordinatorStats.equals(response.coordinatorStats);
+            return executingPolicies.equals(response.executingPolicies)
+                && coordinatorStats.equals(response.coordinatorStats)
+                && Objects.equals(cacheStats, response.cacheStats);
         }
 
         @Override
         public int hashCode() {
-            return Objects.hash(executingPolicies, coordinatorStats);
+            return Objects.hash(executingPolicies, coordinatorStats, cacheStats);
         }
 
         public static class CoordinatorStats implements Writeable, ToXContentFragment {
@@ -118,11 +136,13 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
             private final long remoteRequestsTotal;
             private final long executedSearchesTotal;
 
-            public CoordinatorStats(String nodeId,
-                                    int queueSize,
-                                    int remoteRequestsCurrent,
-                                    long remoteRequestsTotal,
-                                    long executedSearchesTotal) {
+            public CoordinatorStats(
+                String nodeId,
+                int queueSize,
+                int remoteRequestsCurrent,
+                long remoteRequestsTotal,
+                long executedSearchesTotal
+            ) {
                 this.nodeId = nodeId;
                 this.queueSize = queueSize;
                 this.remoteRequestsCurrent = remoteRequestsCurrent;
@@ -178,11 +198,11 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
                 if (this == o) return true;
                 if (o == null || getClass() != o.getClass()) return false;
                 CoordinatorStats stats = (CoordinatorStats) o;
-                return Objects.equals(nodeId, stats.nodeId) &&
-                    queueSize == stats.queueSize &&
-                    remoteRequestsCurrent == stats.remoteRequestsCurrent &&
-                    remoteRequestsTotal == stats.remoteRequestsTotal &&
-                    executedSearchesTotal == stats.executedSearchesTotal;
+                return Objects.equals(nodeId, stats.nodeId)
+                    && queueSize == stats.queueSize
+                    && remoteRequestsCurrent == stats.remoteRequestsCurrent
+                    && remoteRequestsTotal == stats.remoteRequestsTotal
+                    && executedSearchesTotal == stats.executedSearchesTotal;
             }
 
             @Override
@@ -202,7 +222,7 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
             }
 
             ExecutingPolicy(StreamInput in) throws IOException {
-                this(in.readString(), new TaskInfo(in));
+                this(in.readString(), TaskInfo.from(in));
             }
 
             public String getName() {
@@ -235,13 +255,89 @@ public class EnrichStatsAction extends ActionType<EnrichStatsAction.Response> {
                 if (this == o) return true;
                 if (o == null || getClass() != o.getClass()) return false;
                 ExecutingPolicy that = (ExecutingPolicy) o;
-                return name.equals(that.name) &&
-                    taskInfo.equals(that.taskInfo);
+                return name.equals(that.name) && taskInfo.equals(that.taskInfo);
             }
 
             @Override
             public int hashCode() {
                 return Objects.hash(name, taskInfo);
+            }
+        }
+
+        public static class CacheStats implements Writeable, ToXContentFragment {
+
+            private final String nodeId;
+            private final long count;
+            private final long hits;
+            private final long misses;
+            private final long evictions;
+
+            public CacheStats(String nodeId, long count, long hits, long misses, long evictions) {
+                this.nodeId = nodeId;
+                this.count = count;
+                this.hits = hits;
+                this.misses = misses;
+                this.evictions = evictions;
+            }
+
+            public CacheStats(StreamInput in) throws IOException {
+                this(in.readString(), in.readVLong(), in.readVLong(), in.readVLong(), in.readVLong());
+            }
+
+            public String getNodeId() {
+                return nodeId;
+            }
+
+            public long getCount() {
+                return count;
+            }
+
+            public long getHits() {
+                return hits;
+            }
+
+            public long getMisses() {
+                return misses;
+            }
+
+            public long getEvictions() {
+                return evictions;
+            }
+
+            @Override
+            public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+                builder.field("node_id", nodeId);
+                builder.field("count", count);
+                builder.field("hits", hits);
+                builder.field("misses", misses);
+                builder.field("evictions", evictions);
+                return builder;
+            }
+
+            @Override
+            public void writeTo(StreamOutput out) throws IOException {
+                out.writeString(nodeId);
+                out.writeVLong(count);
+                out.writeVLong(hits);
+                out.writeVLong(misses);
+                out.writeVLong(evictions);
+            }
+
+            @Override
+            public boolean equals(Object o) {
+                if (this == o) return true;
+                if (o == null || getClass() != o.getClass()) return false;
+                CacheStats that = (CacheStats) o;
+                return count == that.count
+                    && hits == that.hits
+                    && misses == that.misses
+                    && evictions == that.evictions
+                    && nodeId.equals(that.nodeId);
+            }
+
+            @Override
+            public int hashCode() {
+                return Objects.hash(nodeId, count, hits, misses, evictions);
             }
         }
     }

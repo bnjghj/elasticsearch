@@ -1,29 +1,25 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.ml.dataframe.extractor;
 
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.elasticsearch.action.ActionListener;
-import org.elasticsearch.action.search.ClearScrollAction;
-import org.elasticsearch.action.search.ClearScrollRequest;
-import org.elasticsearch.action.search.SearchAction;
 import org.elasticsearch.action.search.SearchRequestBuilder;
 import org.elasticsearch.action.search.SearchResponse;
-import org.elasticsearch.action.search.SearchScrollAction;
-import org.elasticsearch.action.search.SearchScrollRequestBuilder;
-import org.elasticsearch.client.Client;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.unit.TimeValue;
+import org.elasticsearch.action.search.TransportSearchAction;
+import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.common.util.CachedSupplier;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.query.BoolQueryBuilder;
 import org.elasticsearch.index.query.QueryBuilder;
 import org.elasticsearch.index.query.QueryBuilders;
 import org.elasticsearch.search.SearchHit;
+import org.elasticsearch.search.SearchHits;
 import org.elasticsearch.search.fetch.StoredFieldsContext;
 import org.elasticsearch.search.sort.SortOrder;
 import org.elasticsearch.xpack.core.ClientHelper;
@@ -46,30 +42,34 @@ import java.util.NoSuchElementException;
 import java.util.Objects;
 import java.util.Optional;
 import java.util.Set;
-import java.util.concurrent.TimeUnit;
 import java.util.function.Supplier;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
+import static org.elasticsearch.core.Strings.format;
+import static org.elasticsearch.xpack.ml.dataframe.DestinationIndex.INCREMENTAL_ID;
+
 /**
- * An implementation that extracts data from elasticsearch using search and scroll on a client.
- * It supports safe and responsive cancellation by continuing the scroll until a new timestamp
- * is seen.
+ * An implementation that extracts data from elasticsearch using ranged searches
+ * on the incremental id.
+ * We detect the end of the extraction by doing an additional search at the end
+ * which should return empty results.
+ * It supports safe and responsive cancellation by continuing from the latest
+ * incremental id that was seen.
  * Note that this class is NOT thread-safe.
  */
 public class DataFrameDataExtractor {
 
     private static final Logger LOGGER = LogManager.getLogger(DataFrameDataExtractor.class);
-    private static final TimeValue SCROLL_TIMEOUT = new TimeValue(30, TimeUnit.MINUTES);
 
     public static final String NULL_VALUE = "\0";
 
     private final Client client;
     private final DataFrameDataExtractorContext context;
-    private String scrollId;
+    private long lastSortKey = -1;
     private boolean isCancelled;
     private boolean hasNext;
-    private boolean searchHasShardFailure;
+    private boolean hasPreviousSearchFailed;
     private final CachedSupplier<TrainTestSplitter> trainTestSplitter;
     // These are fields that are sent directly to the analytics process
     // They are not passed through a feature_processor
@@ -81,22 +81,13 @@ public class DataFrameDataExtractor {
     DataFrameDataExtractor(Client client, DataFrameDataExtractorContext context) {
         this.client = Objects.requireNonNull(client);
         this.context = Objects.requireNonNull(context);
-        Set<String> processedFieldInputs = context.extractedFields.getProcessedFieldInputs();
-        this.organicFeatures = context.extractedFields.getAllFields()
-            .stream()
-            .map(ExtractedField::getName)
-            .filter(f -> processedFieldInputs.contains(f) == false)
-            .toArray(String[]::new);
-        this.processedFeatures = context.extractedFields.getProcessedFields()
-            .stream()
-            .map(ProcessedField::getOutputFieldNames)
-            .flatMap(List::stream)
-            .toArray(String[]::new);
+        this.organicFeatures = context.extractedFields.extractOrganicFeatureNames();
+        this.processedFeatures = context.extractedFields.extractProcessedFeatureNames();
         this.extractedFieldsByName = new LinkedHashMap<>();
         context.extractedFields.getAllFields().forEach(f -> this.extractedFieldsByName.put(f.getName(), f));
         hasNext = true;
-        searchHasShardFailure = false;
-        this.trainTestSplitter = new CachedSupplier<>(context.trainTestSplitterFactory::create);
+        hasPreviousSearchFailed = false;
+        this.trainTestSplitter = CachedSupplier.wrap(context.trainTestSplitterFactory::create);
     }
 
     public Map<String, String> getHeaders() {
@@ -112,45 +103,98 @@ public class DataFrameDataExtractor {
     }
 
     public void cancel() {
-        LOGGER.debug("[{}] Data extractor was cancelled", context.jobId);
+        LOGGER.debug(() -> "[" + context.jobId + "] Data extractor was cancelled");
         isCancelled = true;
     }
 
     public Optional<List<Row>> next() throws IOException {
-        if (!hasNext()) {
+        if (hasNext() == false) {
             throw new NoSuchElementException();
         }
 
-        Optional<List<Row>> hits = scrollId == null ? Optional.ofNullable(initScroll()) : Optional.ofNullable(continueScroll());
-        if (!hits.isPresent()) {
+        Optional<List<Row>> hits = Optional.ofNullable(nextSearch());
+        if (hits.isPresent() && hits.get().isEmpty() == false) {
+            lastSortKey = hits.get().get(hits.get().size() - 1).getSortKey();
+        } else {
             hasNext = false;
         }
         return hits;
     }
 
-    protected List<Row> initScroll() throws IOException {
-        LOGGER.debug("[{}] Initializing scroll", context.jobId);
+    /**
+     * Provides a preview of the data. Assumes this was created from the source indices.
+     * Does no sorting of the results.
+     * @param listener To alert with the extracted rows
+     */
+    public void preview(ActionListener<List<Row>> listener) {
+
+        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
+            // This ensures the search throws if there are failures and the scroll context gets cleared automatically
+            .setAllowPartialSearchResults(false)
+            .setIndices(context.indices)
+            .setSize(context.scrollSize)
+            .setQuery(QueryBuilders.boolQuery().filter(context.query));
+
+        setFetchSource(searchRequestBuilder);
+
+        for (ExtractedField docValueField : context.extractedFields.getDocValueFields()) {
+            searchRequestBuilder.addDocValueField(docValueField.getSearchField(), docValueField.getDocValueFormat());
+        }
+
+        searchRequestBuilder.setRuntimeMappings(context.runtimeMappings);
+
+        ClientHelper.executeWithHeadersAsync(
+            context.headers,
+            ClientHelper.ML_ORIGIN,
+            client,
+            TransportSearchAction.TYPE,
+            searchRequestBuilder.request(),
+            listener.delegateFailureAndWrap((delegate, searchResponse) -> {
+                if (searchResponse.getHits().getHits().length == 0) {
+                    delegate.onResponse(Collections.emptyList());
+                    return;
+                }
+
+                List<Row> rows = new ArrayList<>(searchResponse.getHits().getHits().length);
+                for (SearchHit hit : searchResponse.getHits().getHits()) {
+                    var unpooled = hit.asUnpooled();
+                    String[] extractedValues = extractValues(unpooled);
+                    rows.add(extractedValues == null ? new Row(null, unpooled, true) : new Row(extractedValues, unpooled, false));
+                }
+                delegate.onResponse(rows);
+            })
+        );
+    }
+
+    protected List<Row> nextSearch() throws IOException {
         return tryRequestWithSearchResponse(() -> executeSearchRequest(buildSearchRequest()));
     }
 
     private List<Row> tryRequestWithSearchResponse(Supplier<SearchResponse> request) throws IOException {
         try {
+
             // We've set allow_partial_search_results to false which means if something
             // goes wrong the request will throw.
             SearchResponse searchResponse = request.get();
-            LOGGER.debug("[{}] Search response was obtained", context.jobId);
+            try {
+                LOGGER.trace(() -> "[" + context.jobId + "] Search response was obtained");
 
-            // Request was successful so we can restore the flag to retry if a future failure occurs
-            searchHasShardFailure = false;
+                List<Row> rows = processSearchResponse(searchResponse);
 
-            return processSearchResponse(searchResponse);
+                // Request was successfully executed and processed so we can restore the flag to retry if a future failure occurs
+                hasPreviousSearchFailed = false;
+
+                return rows;
+            } finally {
+                searchResponse.decRef();
+            }
         } catch (Exception e) {
-            if (searchHasShardFailure) {
+            if (hasPreviousSearchFailed) {
                 throw e;
             }
-            LOGGER.warn(new ParameterizedMessage("[{}] Search resulted to failure; retrying once", context.jobId), e);
+            LOGGER.warn(() -> "[" + context.jobId + "] Search resulted to failure; retrying once", e);
             markScrollAsErrored();
-            return initScroll();
+            return nextSearch();
         }
     }
 
@@ -159,19 +203,31 @@ public class DataFrameDataExtractor {
     }
 
     private SearchRequestBuilder buildSearchRequest() {
-        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client, SearchAction.INSTANCE)
-                .setScroll(SCROLL_TIMEOUT)
-                // This ensures the search throws if there are failures and the scroll context gets cleared automatically
-                .setAllowPartialSearchResults(false)
-                .addSort(DestinationIndex.ID_COPY, SortOrder.ASC)
-                .setIndices(context.indices)
-                .setSize(context.scrollSize)
-                .setQuery(context.query);
+        long from = lastSortKey + 1;
+        long to = from + context.scrollSize;
+
+        LOGGER.trace(() -> format("[%s] Searching docs with [%s] in [%s, %s)", context.jobId, INCREMENTAL_ID, from, to));
+
+        SearchRequestBuilder searchRequestBuilder = new SearchRequestBuilder(client)
+            // This ensures the search throws if there are failures and the scroll context gets cleared automatically
+            .setAllowPartialSearchResults(false)
+            .addSort(DestinationIndex.INCREMENTAL_ID, SortOrder.ASC)
+            .setIndices(context.indices)
+            .setSize(context.scrollSize);
+
+        searchRequestBuilder.setQuery(
+            QueryBuilders.boolQuery()
+                .filter(context.query)
+                .filter(QueryBuilders.rangeQuery(DestinationIndex.INCREMENTAL_ID).gte(from).lt(to))
+        );
+
         setFetchSource(searchRequestBuilder);
 
         for (ExtractedField docValueField : context.extractedFields.getDocValueFields()) {
             searchRequestBuilder.addDocValueField(docValueField.getSearchField(), docValueField.getDocValueFormat());
         }
+
+        searchRequestBuilder.setRuntimeMappings(context.runtimeMappings);
 
         return searchRequestBuilder;
     }
@@ -191,19 +247,16 @@ public class DataFrameDataExtractor {
     }
 
     private List<Row> processSearchResponse(SearchResponse searchResponse) {
-        scrollId = searchResponse.getScrollId();
         if (searchResponse.getHits().getHits().length == 0) {
             hasNext = false;
-            clearScroll(scrollId);
             return null;
         }
 
-        SearchHit[] hits = searchResponse.getHits().getHits();
-        List<Row> rows = new ArrayList<>(hits.length);
+        SearchHits hits = searchResponse.getHits();
+        List<Row> rows = new ArrayList<>(hits.getHits().length);
         for (SearchHit hit : hits) {
             if (isCancelled) {
                 hasNext = false;
-                clearScroll(scrollId);
                 break;
             }
             rows.add(createRow(hit));
@@ -245,7 +298,8 @@ public class DataFrameDataExtractor {
                 "field_processor [{}] output size expected to be [{}], instead it was [{}]",
                 processedField.getProcessorName(),
                 processedField.getOutputFieldNames().size(),
-                values.length);
+                values.length
+            );
         }
 
         for (int i = 0; i < processedField.getOutputFieldNames().size(); ++i) {
@@ -264,55 +318,51 @@ public class DataFrameDataExtractor {
     }
 
     private Row createRow(SearchHit hit) {
+        var unpooled = hit.asUnpooled();
+        String[] extractedValues = extractValues(unpooled);
+        if (extractedValues == null) {
+            return new Row(null, unpooled, true);
+        }
+        boolean isTraining = trainTestSplitter.get().isTraining(extractedValues);
+        Row row = new Row(extractedValues, unpooled, isTraining);
+        LOGGER.trace(
+            () -> format(
+                "[%s] Extracted row: sort key = [%s], is_training = [%s], values = %s",
+                context.jobId,
+                row.getSortKey(),
+                isTraining,
+                Arrays.toString(row.values)
+            )
+        );
+        return row;
+    }
+
+    private String[] extractValues(SearchHit hit) {
         String[] extractedValues = new String[organicFeatures.length + processedFeatures.length];
         int i = 0;
         for (String organicFeature : organicFeatures) {
             String extractedValue = extractNonProcessedValues(hit, organicFeature);
             if (extractedValue == null) {
-                return new Row(null, hit, true);
+                return null;
             }
             extractedValues[i++] = extractedValue;
         }
         for (ProcessedField processedField : context.extractedFields.getProcessedFields()) {
             String[] processedValues = extractProcessedValue(processedField, hit);
             if (processedValues == null) {
-                return new Row(null, hit, true);
+                return null;
             }
             for (String processedValue : processedValues) {
                 extractedValues[i++] = processedValue;
             }
         }
-        boolean isTraining = trainTestSplitter.get().isTraining(extractedValues);
-        return new Row(extractedValues, hit, isTraining);
-    }
-
-    private List<Row> continueScroll() throws IOException {
-        LOGGER.debug("[{}] Continuing scroll with id [{}]", context.jobId, scrollId);
-        return tryRequestWithSearchResponse(() -> executeSearchScrollRequest(scrollId));
+        return extractedValues;
     }
 
     private void markScrollAsErrored() {
         // This could be a transient error with the scroll Id.
         // Reinitialise the scroll and try again but only once.
-        scrollId = null;
-        searchHasShardFailure = true;
-    }
-
-    protected SearchResponse executeSearchScrollRequest(String scrollId) {
-        return ClientHelper.executeWithHeaders(context.headers, ClientHelper.ML_ORIGIN, client,
-                () -> new SearchScrollRequestBuilder(client, SearchScrollAction.INSTANCE)
-                .setScroll(SCROLL_TIMEOUT)
-                .setScrollId(scrollId)
-                .get());
-    }
-
-    private void clearScroll(String scrollId) {
-        if (scrollId != null) {
-            ClearScrollRequest request = new ClearScrollRequest();
-            request.addScrollId(scrollId);
-            ClientHelper.executeWithHeaders(context.headers, ClientHelper.ML_ORIGIN, client,
-                    () -> client.execute(ClearScrollAction.INSTANCE, request).actionGet());
-        }
+        hasPreviousSearchFailed = true;
     }
 
     public List<String> getFieldNames() {
@@ -326,42 +376,44 @@ public class DataFrameDataExtractor {
     public DataSummary collectDataSummary() {
         SearchRequestBuilder searchRequestBuilder = buildDataSummarySearchRequestBuilder();
         SearchResponse searchResponse = executeSearchRequest(searchRequestBuilder);
-        long rows = searchResponse.getHits().getTotalHits().value;
-        LOGGER.debug("[{}] Data summary rows [{}]", context.jobId, rows);
-        return new DataSummary(rows, organicFeatures.length + processedFeatures.length);
+        try {
+            long rows = searchResponse.getHits().getTotalHits().value;
+            LOGGER.debug(() -> format("[%s] Data summary rows [%s]", context.jobId, rows));
+            return new DataSummary(rows, organicFeatures.length + processedFeatures.length);
+        } finally {
+            searchResponse.decRef();
+        }
     }
 
     public void collectDataSummaryAsync(ActionListener<DataSummary> dataSummaryActionListener) {
         SearchRequestBuilder searchRequestBuilder = buildDataSummarySearchRequestBuilder();
         final int numberOfFields = organicFeatures.length + processedFeatures.length;
 
-        ClientHelper.executeWithHeadersAsync(context.headers,
+        ClientHelper.executeWithHeadersAsync(
+            context.headers,
             ClientHelper.ML_ORIGIN,
             client,
-            SearchAction.INSTANCE,
+            TransportSearchAction.TYPE,
             searchRequestBuilder.request(),
-            ActionListener.wrap(
-                searchResponse -> dataSummaryActionListener.onResponse(
-                    new DataSummary(searchResponse.getHits().getTotalHits().value, numberOfFields)),
-            dataSummaryActionListener::onFailure
-        ));
+            dataSummaryActionListener.delegateFailureAndWrap(
+                (l, searchResponse) -> l.onResponse(new DataSummary(searchResponse.getHits().getTotalHits().value, numberOfFields))
+            )
+        );
     }
 
     private SearchRequestBuilder buildDataSummarySearchRequestBuilder() {
 
         QueryBuilder summaryQuery = context.query;
         if (context.supportsRowsWithMissingValues == false) {
-            summaryQuery = QueryBuilders.boolQuery()
-                .filter(summaryQuery)
-                .filter(allExtractedFieldsExistQuery());
+            summaryQuery = QueryBuilders.boolQuery().filter(summaryQuery).filter(allExtractedFieldsExistQuery());
         }
 
-        return new SearchRequestBuilder(client, SearchAction.INSTANCE)
-            .setAllowPartialSearchResults(false)
+        return new SearchRequestBuilder(client).setAllowPartialSearchResults(false)
             .setIndices(context.indices)
             .setSize(0)
             .setQuery(summaryQuery)
-            .setTrackTotalHits(true);
+            .setTrackTotalHits(true)
+            .setRuntimeMappings(context.runtimeMappings);
     }
 
     private QueryBuilder allExtractedFieldsExistQuery() {
@@ -376,8 +428,11 @@ public class DataFrameDataExtractor {
         return ExtractedFieldsDetector.getCategoricalOutputFields(context.extractedFields, analysis);
     }
 
-    private static boolean isValidValue(Object value) {
-        return value instanceof Number || value instanceof String;
+    public static boolean isValidValue(Object value) {
+        // We should allow a number, string or a boolean.
+        // It is possible for a field to be categorical and have a `keyword` mapping, but be any of these
+        // three types, in the same index.
+        return value instanceof Number || value instanceof String || value instanceof Boolean;
     }
 
     public static class DataSummary {
@@ -424,7 +479,11 @@ public class DataFrameDataExtractor {
         }
 
         public int getChecksum() {
-            return Arrays.hashCode(values);
+            return (int) getSortKey();
+        }
+
+        public long getSortKey() {
+            return (long) hit.getSortValues()[0];
         }
     }
 }

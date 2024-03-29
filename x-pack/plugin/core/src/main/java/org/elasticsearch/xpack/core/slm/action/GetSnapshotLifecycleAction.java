@@ -1,20 +1,20 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 
 package org.elasticsearch.xpack.core.slm.action;
 
-import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.support.master.AcknowledgedRequest;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.xcontent.ToXContentObject;
-import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xpack.core.slm.SnapshotLifecyclePolicyItem;
 
 import java.io.IOException;
@@ -27,7 +27,7 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
     public static final String NAME = "cluster:admin/slm/get";
 
     protected GetSnapshotLifecycleAction() {
-        super(NAME, GetSnapshotLifecycleAction.Response::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<GetSnapshotLifecycleAction.Request> {
@@ -49,11 +49,6 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
 
         public String[] getLifecycleIds() {
             return this.lifecycleIds;
-        }
-
-        @Override
-        public ActionRequestValidationException validate() {
-            return null;
         }
 
         @Override
@@ -84,14 +79,14 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
 
         private List<SnapshotLifecyclePolicyItem> lifecycles;
 
-        public Response() { }
+        public Response() {}
 
         public Response(List<SnapshotLifecyclePolicyItem> lifecycles) {
             this.lifecycles = lifecycles;
         }
 
         public Response(StreamInput in) throws IOException {
-            this.lifecycles = in.readList(SnapshotLifecyclePolicyItem::new);
+            this.lifecycles = in.readCollectionAsList(SnapshotLifecyclePolicyItem::new);
         }
 
         public List<SnapshotLifecyclePolicyItem> getPolicies() {
@@ -115,7 +110,7 @@ public class GetSnapshotLifecycleAction extends ActionType<GetSnapshotLifecycleA
 
         @Override
         public void writeTo(StreamOutput out) throws IOException {
-            out.writeList(lifecycles);
+            out.writeCollection(lifecycles);
         }
 
         @Override

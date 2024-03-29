@@ -1,4 +1,5 @@
-apply plugin: 'elasticsearch.esplugin'
+apply plugin: 'elasticsearch.internal-es-plugin'
+apply plugin: 'elasticsearch.internal-java-rest-test'
 
 esplugin {
   name 'x-pack-stack'
@@ -8,20 +9,26 @@ esplugin {
   hasNativeController false
   requiresKeystore true
 }
-archivesBaseName = 'x-pack-stack'
+
+base {
+  archivesName = 'x-pack-stack'
+}
 
 dependencies {
-  compileOnly project(path: xpackModule('core'), configuration: 'default')
-  testImplementation project(path: xpackModule('core'), configuration: 'testArtifacts')
+  compileOnly project(path: xpackModule('core'))
+  testImplementation project(':modules:data-streams')
+  javaRestTestImplementation(testArtifact(project(xpackModule('core'))))
+  javaRestTestImplementation project(path: ':x-pack:plugin:stack')
+  clusterModules project(':modules:mapper-extras')
+  clusterModules project(xpackModule('wildcard'))
 }
 
-// add all sub-projects of the qa sub-project
-gradle.projectsEvaluated {
-  project.subprojects
-    .find { it.path == project.path + ":qa" }
-    .subprojects
-    .findAll { it.path.startsWith(project.path + ":qa") }
-    .each { check.dependsOn it.check }
+// These tests are only invoked direclty as part of a dedicated build job
+tasks.named('javaRestTest').configure {task ->
+    onlyIf("E2E test task must be invoked directly") {
+      gradle.startParameter.getTaskNames().contains(task.path) ||
+        (gradle.startParameter.getTaskNames().contains(task.name) && gradle.startParameter.currentDir == project.projectDir)
+    }
 }
 
-integTest.enabled = false
+addQaCheckDependencies(project)

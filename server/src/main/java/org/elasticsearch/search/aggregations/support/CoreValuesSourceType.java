@@ -1,26 +1,22 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.search.aggregations.support;
 
-import org.apache.lucene.index.IndexReader;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.apache.lucene.index.DocValues;
+import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.search.BooleanClause;
+import org.apache.lucene.search.PointRangeQuery;
+import org.apache.lucene.search.Query;
+import org.apache.lucene.search.QueryVisitor;
 import org.apache.lucene.util.BytesRef;
 import org.elasticsearch.common.Rounding;
 import org.elasticsearch.common.geo.GeoPoint;
@@ -35,7 +31,7 @@ import org.elasticsearch.index.mapper.MappedFieldType;
 import org.elasticsearch.index.mapper.RangeFieldMapper;
 import org.elasticsearch.script.AggregationScript;
 import org.elasticsearch.search.DocValueFormat;
-import org.elasticsearch.search.aggregations.AggregationExecutionException;
+import org.elasticsearch.search.aggregations.AggregationErrors;
 
 import java.io.IOException;
 import java.time.ZoneId;
@@ -66,8 +62,9 @@ public enum CoreValuesSourceType implements ValuesSourceType {
         public ValuesSource getField(FieldContext fieldContext, AggregationScript.LeafFactory script) {
 
             if ((fieldContext.indexFieldData() instanceof IndexNumericFieldData) == false) {
-                throw new IllegalArgumentException("Expected numeric type on field [" + fieldContext.field() +
-                    "], but got [" + fieldContext.fieldType().typeName() + "]");
+                throw new IllegalArgumentException(
+                    "Expected numeric type on field [" + fieldContext.field() + "], but got [" + fieldContext.fieldType().typeName() + "]"
+                );
             }
 
             ValuesSource.Numeric dataSource = new ValuesSource.Numeric.FieldData((IndexNumericFieldData) fieldContext.indexFieldData());
@@ -79,9 +76,18 @@ public enum CoreValuesSourceType implements ValuesSourceType {
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
-            Number missing = docValueFormat.parseDouble(rawMissing.toString(), false, nowSupplier);
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
+            Number missing;
+            if (rawMissing instanceof Number) {
+                missing = (Number) rawMissing;
+            } else {
+                missing = docValueFormat.parseDouble(rawMissing.toString(), false, nowInMillis);
+            }
             return MissingValues.replaceMissing((ValuesSource.Numeric) valuesSource, missing);
         }
 
@@ -101,7 +107,7 @@ public enum CoreValuesSourceType implements ValuesSourceType {
 
         }
     },
-    BYTES() {
+    KEYWORD() {
         @Override
         public ValuesSource getEmpty() {
             return ValuesSource.Bytes.WithOrdinals.EMPTY;
@@ -129,8 +135,12 @@ public enum CoreValuesSourceType implements ValuesSourceType {
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
             final BytesRef missing = docValueFormat.parseBytesRef(rawMissing.toString());
             if (valuesSource instanceof ValuesSource.Bytes.WithOrdinals) {
                 return MissingValues.replaceMissing((ValuesSource.Bytes.WithOrdinals) valuesSource, missing);
@@ -147,22 +157,26 @@ public enum CoreValuesSourceType implements ValuesSourceType {
 
         @Override
         public ValuesSource getScript(AggregationScript.LeafFactory script, ValueType scriptValueType) {
-            throw new AggregationExecutionException("value source of type [" + this.value() + "] is not supported by scripts");
+            throw AggregationErrors.valuesSourceDoesNotSupportScritps(this.value());
         }
 
         @Override
         public ValuesSource getField(FieldContext fieldContext, AggregationScript.LeafFactory script) {
-            if (!(fieldContext.indexFieldData() instanceof IndexGeoPointFieldData)) {
-                throw new IllegalArgumentException("Expected geo_point type on field [" + fieldContext.field() +
-                    "], but got [" + fieldContext.fieldType().typeName() + "]");
+            if (fieldContext.indexFieldData() instanceof IndexGeoPointFieldData pointFieldData) {
+                return new ValuesSource.GeoPoint.Fielddata(pointFieldData);
             }
-
-            return new ValuesSource.GeoPoint.Fielddata((IndexGeoPointFieldData) fieldContext.indexFieldData());
+            throw new IllegalArgumentException(
+                "Expected geo_point type on field [" + fieldContext.field() + "], but got [" + fieldContext.fieldType().typeName() + "]"
+            );
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
             // TODO: also support the structured formats of geo points
             final GeoPoint missing = new GeoPoint(rawMissing.toString());
             return MissingValues.replaceMissing((ValuesSource.GeoPoint) valuesSource, missing);
@@ -181,7 +195,7 @@ public enum CoreValuesSourceType implements ValuesSourceType {
 
         @Override
         public ValuesSource getScript(AggregationScript.LeafFactory script, ValueType scriptValueType) {
-            throw new AggregationExecutionException("value source of type [" + this.value() + "] is not supported by scripts");
+            throw AggregationErrors.valuesSourceDoesNotSupportScritps(this.value());
         }
 
         @Override
@@ -196,31 +210,39 @@ public enum CoreValuesSourceType implements ValuesSourceType {
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
             throw new IllegalArgumentException("Can't apply missing values on a " + valuesSource.getClass());
         }
     },
     IP() {
         @Override
         public ValuesSource getEmpty() {
-            return BYTES.getEmpty();
+            return KEYWORD.getEmpty();
         }
 
         @Override
         public ValuesSource getScript(AggregationScript.LeafFactory script, ValueType scriptValueType) {
-            return BYTES.getScript(script, scriptValueType);
+            return KEYWORD.getScript(script, scriptValueType);
         }
 
         @Override
         public ValuesSource getField(FieldContext fieldContext, AggregationScript.LeafFactory script) {
-            return BYTES.getField(fieldContext, script);
+            return KEYWORD.getField(fieldContext, script);
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
-            return BYTES.replaceMissing(valuesSource, rawMissing, docValueFormat, nowSupplier);
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
+            return KEYWORD.replaceMissing(valuesSource, rawMissing, docValueFormat, nowInMillis);
         }
 
         @Override
@@ -251,57 +273,129 @@ public enum CoreValuesSourceType implements ValuesSourceType {
 
         private ValuesSource.Numeric fieldData(FieldContext fieldContext) {
             if ((fieldContext.indexFieldData() instanceof IndexNumericFieldData) == false) {
-                throw new IllegalArgumentException("Expected numeric type on field [" + fieldContext.field() +
-                    "], but got [" + fieldContext.fieldType().typeName() + "]");
+                throw new IllegalArgumentException(
+                    "Expected numeric type on field [" + fieldContext.field() + "], but got [" + fieldContext.fieldType().typeName() + "]"
+                );
             }
-            if (fieldContext.fieldType().isSearchable() == false
-                    || fieldContext.fieldType() instanceof DateFieldType == false) {
-                /*
-                 * We can't implement roundingPreparer in these cases because
-                 * we can't look up the min and max date without both the
-                 * search index (the first test) and the resolution which is
-                 * on the DateFieldType.
-                 */
+            if (fieldContext.fieldType() instanceof DateFieldType == false) {
                 return new ValuesSource.Numeric.FieldData((IndexNumericFieldData) fieldContext.indexFieldData());
             }
+
             return new ValuesSource.Numeric.FieldData((IndexNumericFieldData) fieldContext.indexFieldData()) {
                 /**
                  * Proper dates get a real implementation of
-                 * {@link #roundingPreparer(IndexReader)}. If the field is
+                 * {@link #roundingPreparer(AggregationContext)}. If the field is
                  * configured with a script or a missing value then we'll
                  * wrap this without delegating so those fields will ignore
                  * this implementation. Which is correct.
                  */
                 @Override
-                public Function<Rounding, Rounding.Prepared> roundingPreparer(IndexReader reader) throws IOException {
+                public Function<Rounding, Rounding.Prepared> roundingPreparer(AggregationContext context) throws IOException {
                     DateFieldType dft = (DateFieldType) fieldContext.fieldType();
-                    byte[] min = PointValues.getMinPackedValue(reader, fieldContext.field());
-                    if (min == null) {
-                        // There aren't any indexes values so we don't need to optimize.
+                    /*
+                     * The range of dates, min first, then max. This is an array so we can
+                     * write to it inside the QueryVisitor below.
+                     */
+                    long[] range = new long[] { Long.MIN_VALUE, Long.MAX_VALUE };
+
+                    // Check the search index for bounds
+                    if (fieldContext.fieldType().isIndexed()) {
+                        log.trace("Attempting to apply index bound date rounding");
+                        /*
+                         * We can't look up the min and max date without both the
+                         * search index (isSearchable) and the resolution which
+                         * is on the DateFieldType.
+                         */
+                        byte[] min = PointValues.getMinPackedValue(context.searcher().getIndexReader(), fieldContext.field());
+                        if (min != null) {
+                            // null means that there aren't values in the index
+                            byte[] max = PointValues.getMaxPackedValue(context.searcher().getIndexReader(), fieldContext.field());
+                            range[0] = dft.resolution().parsePointAsMillis(min);
+                            range[1] = dft.resolution().parsePointAsMillis(max);
+                        }
+                    }
+                    log.trace("Bounds after index bound date rounding: {}, {}", range[0], range[1]);
+
+                    boolean isMultiValue = false;
+                    for (LeafReaderContext leaf : context.searcher().getLeafContexts()) {
+                        if (fieldContext.fieldType().isIndexed()) {
+                            PointValues pointValues = leaf.reader().getPointValues(fieldContext.field());
+                            if (pointValues != null && pointValues.size() != pointValues.getDocCount()) {
+                                isMultiValue = true;
+                            }
+                        } else if (fieldContext.fieldType().hasDocValues()) {
+                            if (DocValues.unwrapSingleton(leaf.reader().getSortedNumericDocValues(fieldContext.field())) == null) {
+                                isMultiValue = true;
+                            }
+                        }
+                    }
+
+                    // Check the query for bounds. If the field is multivalued, we can't apply query bounds, because a document that
+                    // matches the query might also have values outside the query, which would not be included in any range.
+                    if (context.query() != null && false == isMultiValue) {
+                        log.trace("Attempting to apply query bound rounding");
+                        context.query().visit(new QueryVisitor() {
+                            @Override
+                            public QueryVisitor getSubVisitor(BooleanClause.Occur occur, Query parent) {
+                                // Only extract bounds queries that must filter the results
+                                return switch (occur) {
+                                    case MUST, FILTER -> this;
+                                    default -> QueryVisitor.EMPTY_VISITOR;
+                                };
+                            };
+
+                            @Override
+                            public boolean acceptField(String field) {
+                                return field.equals(fieldContext.fieldType().name());
+                            };
+
+                            @Override
+                            public void visitLeaf(Query query) {
+                                if (query instanceof PointRangeQuery prq) {
+                                    range[0] = Math.max(range[0], dft.resolution().parsePointAsMillis(prq.getLowerPoint()));
+                                    range[1] = Math.min(range[1], dft.resolution().parsePointAsMillis(prq.getUpperPoint()));
+                                }
+                            };
+                        });
+                    }
+                    log.trace("Bounds after query bound date rounding: {}, {}", range[0], range[1]);
+
+                    if (range[0] == Long.MIN_VALUE && range[1] == Long.MAX_VALUE) {
+                        // Didn't find any bounds
+                        log.trace("Unable to find rounding bounds");
                         return Rounding::prepareForUnknown;
                     }
-                    byte[] max = PointValues.getMaxPackedValue(reader, fieldContext.field());
-                    long minUtcMillis = dft.resolution().parsePointAsMillis(min);
-                    long maxUtcMillis = dft.resolution().parsePointAsMillis(max);
-                    return rounding -> rounding.prepare(minUtcMillis, maxUtcMillis);
+
+                    // If we have bounds stepping over each other from query bound checks, return an unknown rounding
+                    // (which we expect to never actually get any values to round).
+                    if (range[0] > range[1]) {
+                        return Rounding::prepareForUnknown;
+                    }
+
+                    return rounding -> rounding.prepare(range[0], range[1]);
                 }
             };
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
-            return NUMERIC.replaceMissing(valuesSource, rawMissing, docValueFormat, nowSupplier);
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
+            return NUMERIC.replaceMissing(valuesSource, rawMissing, docValueFormat, nowInMillis);
         }
 
         @Override
         public DocValueFormat getFormatter(String format, ZoneId tz) {
-            return  new DocValueFormat.DateTime(
+            return new DocValueFormat.DateTime(
                 format == null ? DateFieldMapper.DEFAULT_DATE_TIME_FORMATTER : DateFormatter.forPattern(format),
                 tz == null ? ZoneOffset.UTC : tz,
                 // If we were just looking at fields, we could read the resolution from the field settings, but we need to deal with script
-                // output, which has no way to indicate the resolution, so we need to default to something.  Milliseconds is the standard.
-                DateFieldMapper.Resolution.MILLISECONDS);
+                // output, which has no way to indicate the resolution, so we need to default to something. Milliseconds is the standard.
+                DateFieldMapper.Resolution.MILLISECONDS
+            );
         }
     },
     BOOLEAN() {
@@ -321,17 +415,22 @@ public enum CoreValuesSourceType implements ValuesSourceType {
         }
 
         @Override
-        public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat,
-                                           LongSupplier nowSupplier) {
-            return NUMERIC.replaceMissing(valuesSource, rawMissing, docValueFormat, nowSupplier);
+        public ValuesSource replaceMissing(
+            ValuesSource valuesSource,
+            Object rawMissing,
+            DocValueFormat docValueFormat,
+            LongSupplier nowInMillis
+        ) {
+            return NUMERIC.replaceMissing(valuesSource, rawMissing, docValueFormat, nowInMillis);
         }
 
         @Override
         public DocValueFormat getFormatter(String format, ZoneId tz) {
             return DocValueFormat.BOOLEAN;
         }
-    }
-    ;
+    };
+
+    public static final Logger log = LogManager.getLogger(CoreValuesSourceType.class);
 
     public static ValuesSourceType fromString(String name) {
         return valueOf(name.trim().toUpperCase(Locale.ROOT));
@@ -347,5 +446,5 @@ public enum CoreValuesSourceType implements ValuesSourceType {
     }
 
     /** List containing all members of the enumeration. */
-    public static List<ValuesSourceType> ALL_CORE = Arrays.asList(CoreValuesSourceType.values());
+    public static final List<ValuesSourceType> ALL_CORE = Arrays.asList(CoreValuesSourceType.values());
 }

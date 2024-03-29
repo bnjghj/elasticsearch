@@ -1,31 +1,29 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 
 package org.elasticsearch.xpack.spatial.search.aggregations.support;
 
 import org.apache.lucene.index.LeafReaderContext;
 import org.apache.lucene.util.BytesRef;
-import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.index.fielddata.IndexGeoPointFieldData;
 import org.elasticsearch.index.fielddata.SortedBinaryDocValues;
 import org.elasticsearch.script.AggregationScript;
 import org.elasticsearch.search.DocValueFormat;
 import org.elasticsearch.search.aggregations.support.FieldContext;
 import org.elasticsearch.search.aggregations.support.MissingValues;
-import org.elasticsearch.search.aggregations.support.ValueType;
 import org.elasticsearch.search.aggregations.support.ValuesSource;
 import org.elasticsearch.search.aggregations.support.ValuesSourceType;
-import org.elasticsearch.xpack.spatial.index.fielddata.IndexGeoShapeFieldData;
-import org.elasticsearch.xpack.spatial.index.fielddata.MultiGeoShapeValues;
+import org.elasticsearch.xpack.spatial.index.fielddata.GeoShapeValues;
+import org.elasticsearch.xpack.spatial.index.fielddata.IndexShapeFieldData;
 
 import java.io.IOException;
 import java.util.function.LongSupplier;
 
-public class GeoShapeValuesSourceType implements Writeable, ValuesSourceType {
+public class GeoShapeValuesSourceType extends ShapeValuesSourceType {
 
     static GeoShapeValuesSourceType INSTANCE = new GeoShapeValuesSourceType();
 
@@ -39,52 +37,48 @@ public class GeoShapeValuesSourceType implements Writeable, ValuesSourceType {
     }
 
     @Override
-    public ValuesSource getScript(AggregationScript.LeafFactory script, ValueType scriptValueType) {
-        // TODO (support scripts)
-        throw new UnsupportedOperationException("geo_shape");
-    }
-
-    @Override
+    @SuppressWarnings("unchecked")
     public ValuesSource getField(FieldContext fieldContext, AggregationScript.LeafFactory script) {
-        boolean isGeoPoint = fieldContext.indexFieldData() instanceof IndexGeoPointFieldData;
-        boolean isGeoShape = fieldContext.indexFieldData() instanceof IndexGeoShapeFieldData;
-        if (isGeoPoint == false && isGeoShape == false) {
-            throw new IllegalArgumentException("Expected geo_point or geo_shape type on field [" + fieldContext.field() +
-                "], but got [" + fieldContext.fieldType().typeName() + "]");
+        boolean isPoint = fieldContext.indexFieldData() instanceof IndexGeoPointFieldData;
+        boolean isShape = fieldContext.indexFieldData() instanceof IndexShapeFieldData;
+        if (isPoint == false && isShape == false) {
+            throw new IllegalArgumentException(
+                "Expected geo_point or geo_shape type on field ["
+                    + fieldContext.field()
+                    + "], but got ["
+                    + fieldContext.fieldType().typeName()
+                    + "]"
+            );
         }
-        if (isGeoPoint) {
+        if (isPoint) {
             return new ValuesSource.GeoPoint.Fielddata((IndexGeoPointFieldData) fieldContext.indexFieldData());
         }
-        return new GeoShapeValuesSource.Fielddata((IndexGeoShapeFieldData) fieldContext.indexFieldData());
+        return new GeoShapeValuesSource.Fielddata((IndexShapeFieldData<GeoShapeValues>) fieldContext.indexFieldData());
     }
 
     @Override
-    public ValuesSource replaceMissing(ValuesSource valuesSource, Object rawMissing, DocValueFormat docValueFormat, LongSupplier now) {
-        GeoShapeValuesSource geoShapeValuesSource = (GeoShapeValuesSource) valuesSource;
-        final MultiGeoShapeValues.GeoShapeValue missing = MultiGeoShapeValues.GeoShapeValue.missing(rawMissing.toString());
+    public ValuesSource replaceMissing(
+        ValuesSource valuesSource,
+        Object rawMissing,
+        DocValueFormat docValueFormat,
+        LongSupplier nowInMillis
+    ) {
+        GeoShapeValuesSource shapeValuesSource = (GeoShapeValuesSource) valuesSource;
+        final GeoShapeValues.GeoShapeValue missing = GeoShapeValues.EMPTY.missing(rawMissing.toString());
         return new GeoShapeValuesSource() {
             @Override
-            public MultiGeoShapeValues geoShapeValues(LeafReaderContext context) {
-                MultiGeoShapeValues values = geoShapeValuesSource.geoShapeValues(context);
-                return new MultiGeoShapeValues() {
+            public GeoShapeValues shapeValues(LeafReaderContext context) {
+                GeoShapeValues values = shapeValuesSource.shapeValues(context);
+                return new GeoShapeValues() {
 
-                    private int count;
+                    private boolean exists;
 
                     @Override
                     public boolean advanceExact(int doc) throws IOException {
-                        if (values.advanceExact(doc)) {
-                            count = values.docValueCount();
-                        } else {
-                            count = 0;
-                        }
+                        exists = values.advanceExact(doc);
                         // always return true because we want to return a value even if
                         // the document does not have a value
                         return true;
-                    }
-
-                    @Override
-                    public int docValueCount() {
-                        return count == 0 ? 1 : count;
                     }
 
                     @Override
@@ -93,24 +87,20 @@ public class GeoShapeValuesSourceType implements Writeable, ValuesSourceType {
                     }
 
                     @Override
-                    public GeoShapeValue nextValue() throws IOException {
-                        if (count > 0) {
-                            return values.nextValue();
-                        } else {
-                            return missing;
-                        }
+                    public GeoShapeValue value() throws IOException {
+                        return exists ? values.value() : missing;
                     }
 
                     @Override
                     public String toString() {
-                        return "anon MultiGeoShapeValues of [" + super.toString() + "]";
+                        return "anon MultiShapeValues of [" + super.toString() + "]";
                     }
                 };
             }
 
             @Override
             public SortedBinaryDocValues bytesValues(LeafReaderContext context) throws IOException {
-                return MissingValues.replaceMissing(geoShapeValuesSource.bytesValues(context), new BytesRef(missing.toString()));
+                return MissingValues.replaceMissing(valuesSource.bytesValues(context), new BytesRef(missing.toString()));
             }
         };
     }
@@ -118,10 +108,5 @@ public class GeoShapeValuesSourceType implements Writeable, ValuesSourceType {
     @Override
     public String typeName() {
         return "geoshape";
-    }
-
-    @Override
-    public void writeTo(StreamOutput out) throws IOException {
-
     }
 }

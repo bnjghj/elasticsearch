@@ -1,7 +1,8 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.core.ssl.action;
 
@@ -10,11 +11,11 @@ import org.elasticsearch.action.ActionRequestBuilder;
 import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionResponse;
 import org.elasticsearch.action.ActionType;
-import org.elasticsearch.client.ElasticsearchClient;
+import org.elasticsearch.client.internal.ElasticsearchClient;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
-import org.elasticsearch.common.xcontent.ToXContentObject;
-import org.elasticsearch.common.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
 import org.elasticsearch.xpack.core.ssl.cert.CertificateInfo;
 
 import java.io.IOException;
@@ -31,7 +32,7 @@ public class GetCertificateInfoAction extends ActionType<GetCertificateInfoActio
     public static final String NAME = "cluster:monitor/xpack/ssl/certificates/get";
 
     private GetCertificateInfoAction() {
-        super(NAME, GetCertificateInfoAction.Response::new);
+        super(NAME);
     }
 
     public static class Request extends ActionRequest {
@@ -83,16 +84,11 @@ public class GetCertificateInfoAction extends ActionType<GetCertificateInfoActio
             }
         }
 
-        }
+    }
 
     public static class RequestBuilder extends ActionRequestBuilder<Request, Response> {
-
-        public RequestBuilder(ElasticsearchClient client, GetCertificateInfoAction action) {
-            super(client, action, new Request());
-        }
-
         public RequestBuilder(ElasticsearchClient client) {
-            this(client, GetCertificateInfoAction.INSTANCE);
+            super(client, GetCertificateInfoAction.INSTANCE, new Request());
         }
     }
 

@@ -1,64 +1,73 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.cluster.metadata;
 
-import org.elasticsearch.cluster.AbstractDiffable;
-import org.elasticsearch.common.Nullable;
-import org.elasticsearch.common.ParseField;
+import org.elasticsearch.TransportVersions;
+import org.elasticsearch.action.admin.indices.rollover.RolloverConfiguration;
+import org.elasticsearch.cluster.SimpleDiffable;
 import org.elasticsearch.common.Strings;
 import org.elasticsearch.common.compress.CompressedXContent;
 import org.elasticsearch.common.io.stream.StreamInput;
 import org.elasticsearch.common.io.stream.StreamOutput;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.xcontent.ConstructingObjectParser;
-import org.elasticsearch.common.xcontent.ToXContentObject;
-import org.elasticsearch.common.xcontent.XContentBuilder;
-import org.elasticsearch.common.xcontent.XContentFactory;
+import org.elasticsearch.common.util.Maps;
 import org.elasticsearch.common.xcontent.XContentHelper;
-import org.elasticsearch.common.xcontent.XContentParser;
-import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.core.Nullable;
 import org.elasticsearch.index.mapper.MapperService;
+import org.elasticsearch.xcontent.ConstructingObjectParser;
+import org.elasticsearch.xcontent.ObjectParser;
+import org.elasticsearch.xcontent.ParseField;
+import org.elasticsearch.xcontent.ToXContentObject;
+import org.elasticsearch.xcontent.XContentBuilder;
+import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentType;
 
 import java.io.IOException;
+import java.util.Base64;
 import java.util.HashMap;
 import java.util.Map;
 import java.util.Objects;
 
 /**
- * A template consists of optional settings, mappings, or alias configuration for an index, however,
- * it is entirely independent from an index. It's a building block forming part of a regular index
+ * A template consists of optional settings, mappings, alias or lifecycle configuration for an index or data stream, however,
+ * it is entirely independent of an index or data stream. It's a building block forming part of a regular index
  * template and a {@link ComponentTemplate}.
  */
-public class Template extends AbstractDiffable<Template> implements ToXContentObject {
+public class Template implements SimpleDiffable<Template>, ToXContentObject {
+
     private static final ParseField SETTINGS = new ParseField("settings");
     private static final ParseField MAPPINGS = new ParseField("mappings");
     private static final ParseField ALIASES = new ParseField("aliases");
+    private static final ParseField LIFECYCLE = new ParseField("lifecycle");
 
     @SuppressWarnings("unchecked")
-    public static final ConstructingObjectParser<Template, Void> PARSER = new ConstructingObjectParser<>("template", false,
-        a -> new Template((Settings) a[0], (CompressedXContent) a[1], (Map<String, AliasMetadata>) a[2]));
+    public static final ConstructingObjectParser<Template, Void> PARSER = new ConstructingObjectParser<>(
+        "template",
+        false,
+        a -> new Template((Settings) a[0], (CompressedXContent) a[1], (Map<String, AliasMetadata>) a[2], (DataStreamLifecycle) a[3])
+    );
 
     static {
         PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> Settings.fromXContent(p), SETTINGS);
-        PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) ->
-            new CompressedXContent(Strings.toString(XContentFactory.jsonBuilder().map(p.mapOrdered()))), MAPPINGS);
+        PARSER.declareField(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> {
+            XContentParser.Token token = p.currentToken();
+            if (token == XContentParser.Token.VALUE_STRING) {
+                return new CompressedXContent(Base64.getDecoder().decode(p.text()));
+            } else if (token == XContentParser.Token.VALUE_EMBEDDED_OBJECT) {
+                return new CompressedXContent(p.binaryValue());
+            } else if (token == XContentParser.Token.START_OBJECT) {
+                return new CompressedXContent(Strings.toString(XContentFactory.jsonBuilder().map(p.mapOrdered())));
+            } else {
+                throw new IllegalArgumentException("Unexpected token: " + token);
+            }
+        }, MAPPINGS, ObjectParser.ValueType.VALUE_OBJECT_ARRAY);
         PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> {
             Map<String, AliasMetadata> aliasMap = new HashMap<>();
             while ((p.nextToken()) != XContentParser.Token.END_OBJECT) {
@@ -67,6 +76,7 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             }
             return aliasMap;
         }, ALIASES);
+        PARSER.declareObject(ConstructingObjectParser.optionalConstructorArg(), (p, c) -> DataStreamLifecycle.fromXContent(p), LIFECYCLE);
     }
 
     @Nullable
@@ -76,10 +86,23 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
     @Nullable
     private final Map<String, AliasMetadata> aliases;
 
-    public Template(@Nullable Settings settings, @Nullable CompressedXContent mappings, @Nullable Map<String, AliasMetadata> aliases) {
+    @Nullable
+    private final DataStreamLifecycle lifecycle;
+
+    public Template(
+        @Nullable Settings settings,
+        @Nullable CompressedXContent mappings,
+        @Nullable Map<String, AliasMetadata> aliases,
+        @Nullable DataStreamLifecycle lifecycle
+    ) {
         this.settings = settings;
         this.mappings = mappings;
         this.aliases = aliases;
+        this.lifecycle = lifecycle;
+    }
+
+    public Template(@Nullable Settings settings, @Nullable CompressedXContent mappings, @Nullable Map<String, AliasMetadata> aliases) {
+        this(settings, mappings, aliases, null);
     }
 
     public Template(StreamInput in) throws IOException {
@@ -94,22 +117,42 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             this.mappings = null;
         }
         if (in.readBoolean()) {
-            this.aliases = in.readMap(StreamInput::readString, AliasMetadata::new);
+            this.aliases = in.readMap(AliasMetadata::new);
         } else {
             this.aliases = null;
         }
+        if (in.getTransportVersion().onOrAfter(DataStreamLifecycle.ADDED_ENABLED_FLAG_VERSION)) {
+            this.lifecycle = in.readOptionalWriteable(DataStreamLifecycle::new);
+        } else if (in.getTransportVersion().onOrAfter(TransportVersions.V_8_9_X)) {
+            boolean isExplicitNull = in.readBoolean();
+            if (isExplicitNull) {
+                this.lifecycle = DataStreamLifecycle.newBuilder().enabled(false).build();
+            } else {
+                this.lifecycle = in.readOptionalWriteable(DataStreamLifecycle::new);
+            }
+        } else {
+            this.lifecycle = null;
+        }
     }
 
+    @Nullable
     public Settings settings() {
         return settings;
     }
 
+    @Nullable
     public CompressedXContent mappings() {
         return mappings;
     }
 
+    @Nullable
     public Map<String, AliasMetadata> aliases() {
         return aliases;
+    }
+
+    @Nullable
+    public DataStreamLifecycle lifecycle() {
+        return lifecycle;
     }
 
     @Override
@@ -118,7 +161,7 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             out.writeBoolean(false);
         } else {
             out.writeBoolean(true);
-            Settings.writeSettingsToStream(this.settings, out);
+            this.settings.writeTo(out);
         }
         if (this.mappings == null) {
             out.writeBoolean(false);
@@ -130,13 +173,22 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             out.writeBoolean(false);
         } else {
             out.writeBoolean(true);
-            out.writeMap(this.aliases, StreamOutput::writeString, (stream, aliasMetadata) -> aliasMetadata.writeTo(stream));
+            out.writeMap(this.aliases, StreamOutput::writeWriteable);
+        }
+        if (out.getTransportVersion().onOrAfter(DataStreamLifecycle.ADDED_ENABLED_FLAG_VERSION)) {
+            out.writeOptionalWriteable(lifecycle);
+        } else if (out.getTransportVersion().onOrAfter(TransportVersions.V_8_9_X)) {
+            boolean isExplicitNull = lifecycle != null && lifecycle.isEnabled() == false;
+            out.writeBoolean(isExplicitNull);
+            if (isExplicitNull == false) {
+                out.writeOptionalWriteable(lifecycle);
+            }
         }
     }
 
     @Override
     public int hashCode() {
-        return Objects.hash(settings, mappings, aliases);
+        return Objects.hash(settings, mappings, aliases, lifecycle);
     }
 
     @Override
@@ -148,9 +200,10 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             return false;
         }
         Template other = (Template) obj;
-        return Objects.equals(settings, other.settings) &&
-            Objects.equals(mappings, other.mappings) &&
-            Objects.equals(aliases, other.aliases);
+        return Objects.equals(settings, other.settings)
+            && mappingsEquals(this.mappings, other.mappings)
+            && Objects.equals(aliases, other.aliases)
+            && Objects.equals(lifecycle, other.lifecycle);
     }
 
     @Override
@@ -160,6 +213,18 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
 
     @Override
     public XContentBuilder toXContent(XContentBuilder builder, Params params) throws IOException {
+        return toXContent(builder, params, null, null);
+    }
+
+    /**
+     * Converts the template to XContent and passes the RolloverConditions, when provided, to the lifecycle.
+     */
+    public XContentBuilder toXContent(
+        XContentBuilder builder,
+        Params params,
+        @Nullable RolloverConfiguration rolloverConfiguration,
+        @Nullable DataStreamGlobalRetention globalRetention
+    ) throws IOException {
         builder.startObject();
         if (this.settings != null) {
             builder.startObject(SETTINGS.getPreferredName());
@@ -167,11 +232,17 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             builder.endObject();
         }
         if (this.mappings != null) {
-            Map<String, Object> uncompressedMapping =
-                XContentHelper.convertToMap(this.mappings.uncompressed(), true, XContentType.JSON).v2();
-            if (uncompressedMapping.size() > 0) {
-                builder.field(MAPPINGS.getPreferredName());
-                builder.map(reduceMapping(uncompressedMapping));
+            String context = params.param(Metadata.CONTEXT_MODE_PARAM, Metadata.CONTEXT_MODE_API);
+            boolean binary = params.paramAsBoolean("binary", false);
+            if (Metadata.CONTEXT_MODE_API.equals(context) || binary == false) {
+                Map<String, Object> uncompressedMapping = XContentHelper.convertToMap(this.mappings.uncompressed(), true, XContentType.JSON)
+                    .v2();
+                if (uncompressedMapping.size() > 0) {
+                    builder.field(MAPPINGS.getPreferredName());
+                    builder.map(reduceMapping(uncompressedMapping));
+                }
+            } else {
+                builder.field(MAPPINGS.getPreferredName(), mappings.compressed());
             }
         }
         if (this.aliases != null) {
@@ -181,16 +252,42 @@ public class Template extends AbstractDiffable<Template> implements ToXContentOb
             }
             builder.endObject();
         }
+        if (this.lifecycle != null) {
+            builder.field(LIFECYCLE.getPreferredName());
+            lifecycle.toXContent(builder, params, rolloverConfiguration, globalRetention);
+        }
         builder.endObject();
         return builder;
     }
 
     @SuppressWarnings("unchecked")
-    private static Map<String, Object> reduceMapping(Map<String, Object> mapping) {
+    static Map<String, Object> reduceMapping(Map<String, Object> mapping) {
         if (mapping.size() == 1 && MapperService.SINGLE_MAPPING_NAME.equals(mapping.keySet().iterator().next())) {
             return (Map<String, Object>) mapping.values().iterator().next();
         } else {
             return mapping;
         }
+    }
+
+    static boolean mappingsEquals(CompressedXContent m1, CompressedXContent m2) {
+        if (m1 == m2) {
+            return true;
+        }
+
+        if (m1 == null || m2 == null) {
+            return false;
+        }
+
+        if (m1.equals(m2)) {
+            return true;
+        }
+
+        Map<String, Object> thisUncompressedMapping = reduceMapping(
+            XContentHelper.convertToMap(m1.uncompressed(), true, XContentType.JSON).v2()
+        );
+        Map<String, Object> otherUncompressedMapping = reduceMapping(
+            XContentHelper.convertToMap(m2.uncompressed(), true, XContentType.JSON).v2()
+        );
+        return Maps.deepEquals(thisUncompressedMapping, otherUncompressedMapping);
     }
 }

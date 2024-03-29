@@ -1,12 +1,12 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 
 package org.elasticsearch.xpack.autoscaling.action;
 
-import org.elasticsearch.action.ActionRequestValidationException;
 import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.support.master.AcknowledgedRequest;
 import org.elasticsearch.action.support.master.AcknowledgedResponse;
@@ -22,7 +22,7 @@ public class DeleteAutoscalingPolicyAction extends ActionType<AcknowledgedRespon
     public static final String NAME = "cluster:admin/autoscaling/delete_autoscaling_policy";
 
     private DeleteAutoscalingPolicyAction() {
-        super(NAME, AcknowledgedResponse::new);
+        super(NAME);
     }
 
     public static class Request extends AcknowledgedRequest<DeleteAutoscalingPolicyAction.Request> {
@@ -46,11 +46,6 @@ public class DeleteAutoscalingPolicyAction extends ActionType<AcknowledgedRespon
         public void writeTo(final StreamOutput out) throws IOException {
             super.writeTo(out);
             out.writeString(name);
-        }
-
-        @Override
-        public ActionRequestValidationException validate() {
-            return null;
         }
 
         @Override

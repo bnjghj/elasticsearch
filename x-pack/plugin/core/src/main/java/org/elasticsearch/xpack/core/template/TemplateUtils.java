@@ -1,33 +1,31 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.core.template;
 
 import org.apache.logging.log4j.Logger;
-import org.apache.logging.log4j.message.ParameterizedMessage;
 import org.elasticsearch.ElasticsearchParseException;
 import org.elasticsearch.Version;
 import org.elasticsearch.cluster.ClusterState;
+import org.elasticsearch.cluster.metadata.ComposableIndexTemplate;
 import org.elasticsearch.cluster.metadata.IndexTemplateMetadata;
 import org.elasticsearch.common.Strings;
-import org.elasticsearch.common.bytes.BytesReference;
 import org.elasticsearch.common.compress.CompressedXContent;
-import org.elasticsearch.common.io.Streams;
-import org.elasticsearch.common.xcontent.LoggingDeprecationHandler;
-import org.elasticsearch.common.xcontent.NamedXContentRegistry;
-import org.elasticsearch.common.xcontent.XContentFactory;
 import org.elasticsearch.common.xcontent.XContentHelper;
-import org.elasticsearch.common.xcontent.XContentParser;
-import org.elasticsearch.common.xcontent.XContentType;
-import org.elasticsearch.common.xcontent.json.JsonXContent;
+import org.elasticsearch.xcontent.XContentFactory;
+import org.elasticsearch.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentParserConfiguration;
+import org.elasticsearch.xcontent.XContentType;
+import org.elasticsearch.xcontent.json.JsonXContent;
+import org.elasticsearch.xpack.core.template.resources.TemplateResources;
 
 import java.io.IOException;
 import java.util.Collections;
 import java.util.Map;
 import java.util.function.Predicate;
-import java.util.regex.Pattern;
 
 import static org.elasticsearch.common.xcontent.XContentHelper.convertToMap;
 
@@ -41,11 +39,18 @@ public class TemplateUtils {
     /**
      * Loads a JSON template as a resource and puts it into the provided map
      */
-    public static void loadTemplateIntoMap(String resource, Map<String, IndexTemplateMetadata> map, String templateName, String version,
-                                           String versionProperty, Logger logger) {
+    public static void loadLegacyTemplateIntoMap(
+        String resource,
+        Map<String, IndexTemplateMetadata> map,
+        String templateName,
+        String version,
+        String versionProperty,
+        Logger logger
+    ) {
         final String template = loadTemplate(resource, version, versionProperty);
-        try (XContentParser parser = XContentFactory.xContent(XContentType.JSON)
-                .createParser(NamedXContentRegistry.EMPTY, LoggingDeprecationHandler.INSTANCE, template)) {
+        try (
+            XContentParser parser = XContentFactory.xContent(XContentType.JSON).createParser(XContentParserConfiguration.EMPTY, template)
+        ) {
             map.put(templateName, IndexTemplateMetadata.Builder.fromXContent(parser, templateName));
         } catch (IOException e) {
             // TODO: should we handle this with a thrown exception?
@@ -65,20 +70,13 @@ public class TemplateUtils {
      */
     public static String loadTemplate(String resource, String version, String versionProperty, Map<String, String> variables) {
         try {
-            String source = load(resource);
+            String source = TemplateResources.load(resource);
             source = replaceVariables(source, version, versionProperty, variables);
             validate(source);
             return source;
         } catch (Exception e) {
             throw new IllegalArgumentException("Unable to load template [" + resource + "]", e);
         }
-    }
-
-    /**
-     * Loads a resource from the classpath and returns it as a {@link BytesReference}
-     */
-    public static String load(String name) throws IOException {
-        return Streams.readFully(TemplateUtils.class.getResourceAsStream(name)).utf8ToString();
     }
 
     /**
@@ -99,7 +97,7 @@ public class TemplateUtils {
         }
     }
 
-    private static String replaceVariables(String input, String version, String versionProperty, Map<String, String> variables) {
+    public static String replaceVariables(String input, String version, String versionProperty, Map<String, String> variables) {
         String template = replaceVariable(input, versionProperty, version);
         for (Map.Entry<String, String> variable : variables.entrySet()) {
             template = replaceVariable(template, variable.getKey(), variable.getValue());
@@ -108,26 +106,25 @@ public class TemplateUtils {
     }
 
     /**
-     * Replaces all occurences of given variable with the value
+     * Replaces all occurrences of given variable with the value
      */
     public static String replaceVariable(String input, String variable, String value) {
-        return Pattern.compile("${" + variable + "}", Pattern.LITERAL)
-                .matcher(input)
-                .replaceAll(value);
+        return input.replace("${" + variable + "}", value);
     }
 
     /**
      * Checks if a versioned template exists, and if it exists checks if the version is greater than or equal to the current version.
      * @param templateName Name of the index template
      * @param state Cluster state
+     * @param currentVersion The current version to check against
      */
-    public static boolean checkTemplateExistsAndVersionIsGTECurrentVersion(String templateName, ClusterState state) {
-        IndexTemplateMetadata templateMetadata = state.metadata().templates().get(templateName);
+    public static boolean checkTemplateExistsAndVersionIsGTECurrentVersion(String templateName, ClusterState state, long currentVersion) {
+        ComposableIndexTemplate templateMetadata = state.metadata().templatesV2().get(templateName);
         if (templateMetadata == null) {
             return false;
         }
 
-        return templateMetadata.version() != null && templateMetadata.version() >= Version.CURRENT.id;
+        return templateMetadata.version() != null && templateMetadata.version() >= currentVersion;
     }
 
     /**
@@ -137,11 +134,9 @@ public class TemplateUtils {
      * @param state Cluster state
      * @param logger Logger
      */
-    public static boolean checkTemplateExistsAndIsUpToDate(
-        String templateName, String versionKey, ClusterState state, Logger logger) {
+    public static boolean checkTemplateExistsAndIsUpToDate(String templateName, String versionKey, ClusterState state, Logger logger) {
 
-        return checkTemplateExistsAndVersionMatches(templateName, versionKey, state, logger,
-            Version.CURRENT::equals);
+        return checkTemplateExistsAndVersionMatches(templateName, versionKey, state, logger, Version.CURRENT::equals);
     }
 
     /**
@@ -153,13 +148,19 @@ public class TemplateUtils {
      * @param predicate Predicate to execute on version check
      */
     public static boolean checkTemplateExistsAndVersionMatches(
-        String templateName, String versionKey, ClusterState state, Logger logger, Predicate<Version> predicate) {
+        String templateName,
+        String versionKey,
+        ClusterState state,
+        Logger logger,
+        Predicate<Version> predicate
+    ) {
 
         IndexTemplateMetadata templateMeta = state.metadata().templates().get(templateName);
         if (templateMeta == null) {
             return false;
         }
         CompressedXContent mappings = templateMeta.getMappings();
+
         // check all mappings contain correct version in _meta
         // we have to parse the source here which is annoying
         if (mappings != null) {
@@ -175,16 +176,14 @@ public class TemplateUtils {
                     return false;
                 }
             } catch (ElasticsearchParseException e) {
-                logger.error(new ParameterizedMessage(
-                    "Cannot parse the template [{}]", templateName), e);
+                logger.error(() -> "Cannot parse the template [" + templateName + "]", e);
                 throw new IllegalStateException("Cannot parse the template " + templateName, e);
             }
         }
         return true;
     }
 
-    private static boolean containsCorrectVersion(String versionKey, Map<String, Object> typeMappingMap,
-                                                  Predicate<Version> predicate) {
+    private static boolean containsCorrectVersion(String versionKey, Map<String, Object> typeMappingMap, Predicate<Version> predicate) {
         @SuppressWarnings("unchecked")
         Map<String, Object> meta = (Map<String, Object>) typeMappingMap.get("_meta");
         if (meta == null) {
@@ -193,5 +192,4 @@ public class TemplateUtils {
         }
         return predicate.test(Version.fromString((String) meta.get(versionKey)));
     }
-
 }

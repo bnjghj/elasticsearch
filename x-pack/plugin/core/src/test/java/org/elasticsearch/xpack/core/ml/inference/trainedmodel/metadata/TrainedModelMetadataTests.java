@@ -1,20 +1,20 @@
 /*
  * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
- * or more contributor license agreements. Licensed under the Elastic License;
- * you may not use this file except in compliance with the Elastic License.
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0; you may not use this file except in compliance with the Elastic License
+ * 2.0.
  */
 package org.elasticsearch.xpack.core.ml.inference.trainedmodel.metadata;
 
-import org.elasticsearch.Version;
+import org.elasticsearch.TransportVersion;
 import org.elasticsearch.common.io.stream.Writeable;
-import org.elasticsearch.common.xcontent.XContentParser;
+import org.elasticsearch.xcontent.XContentParser;
 import org.elasticsearch.xpack.core.ml.AbstractBWCSerializationTestCase;
 import org.junit.Before;
 
 import java.io.IOException;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
-
 
 public class TrainedModelMetadataTests extends AbstractBWCSerializationTestCase<TrainedModelMetadata> {
 
@@ -23,7 +23,12 @@ public class TrainedModelMetadataTests extends AbstractBWCSerializationTestCase<
     public static TrainedModelMetadata randomInstance() {
         return new TrainedModelMetadata(
             randomAlphaOfLength(10),
-            Stream.generate(TotalFeatureImportanceTests::randomInstance).limit(randomIntBetween(1, 10)).collect(Collectors.toList()));
+            Stream.generate(TotalFeatureImportanceTests::randomInstance).limit(randomIntBetween(1, 10)).collect(Collectors.toList()),
+            randomBoolean() ? null : FeatureImportanceBaselineTests.randomInstance(),
+            randomBoolean()
+                ? null
+                : Stream.generate(HyperparametersTests::randomInstance).limit(randomIntBetween(1, 10)).collect(Collectors.toList())
+        );
     }
 
     @Before
@@ -34,6 +39,11 @@ public class TrainedModelMetadataTests extends AbstractBWCSerializationTestCase<
     @Override
     protected TrainedModelMetadata createTestInstance() {
         return randomInstance();
+    }
+
+    @Override
+    protected TrainedModelMetadata mutateInstance(TrainedModelMetadata instance) {
+        return null;// TODO implement https://github.com/elastic/elasticsearch/issues/25929
     }
 
     @Override
@@ -52,7 +62,7 @@ public class TrainedModelMetadataTests extends AbstractBWCSerializationTestCase<
     }
 
     @Override
-    protected TrainedModelMetadata mutateInstanceForVersion(TrainedModelMetadata instance, Version version) {
+    protected TrainedModelMetadata mutateInstanceForVersion(TrainedModelMetadata instance, TransportVersion version) {
         return instance;
     }
 }

@@ -1,41 +1,41 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.search.internal;
 
+import org.apache.lucene.codecs.StoredFieldsReader;
+import org.apache.lucene.index.ByteVectorValues;
 import org.apache.lucene.index.DirectoryReader;
 import org.apache.lucene.index.FilterDirectoryReader;
 import org.apache.lucene.index.FilterLeafReader;
+import org.apache.lucene.index.FilterVectorValues;
+import org.apache.lucene.index.FloatVectorValues;
 import org.apache.lucene.index.IndexReader;
 import org.apache.lucene.index.LeafReader;
 import org.apache.lucene.index.PointValues;
+import org.apache.lucene.index.QueryTimeout;
 import org.apache.lucene.index.Terms;
 import org.apache.lucene.index.TermsEnum;
+import org.apache.lucene.search.DocIdSetIterator;
+import org.apache.lucene.search.KnnCollector;
 import org.apache.lucene.search.suggest.document.CompletionTerms;
+import org.apache.lucene.util.Bits;
 import org.apache.lucene.util.BytesRef;
 import org.apache.lucene.util.automaton.CompiledAutomaton;
+import org.elasticsearch.common.lucene.index.SequentialStoredFieldsLeafReader;
 
 import java.io.IOException;
 
 /**
  * Wraps an {@link IndexReader} with a {@link QueryCancellation}
  * which checks for cancelled or timed-out query.
+ * Note: this class was adapted from Lucene's ExitableDirectoryReader, but instead of using a query timeout for cancellation,
+ *       a {@link QueryCancellation} object is used. The main behavior of the classes is mostly unchanged.
  */
 class ExitableDirectoryReader extends FilterDirectoryReader {
 
@@ -76,10 +76,11 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
     public CacheHelper getReaderCacheHelper() {
         return in.getReaderCacheHelper();
     }
+
     /**
      * Wraps a {@link FilterLeafReader} with a {@link QueryCancellation}.
      */
-    static class ExitableLeafReader extends FilterLeafReader {
+    static class ExitableLeafReader extends SequentialStoredFieldsLeafReader {
 
         private final QueryCancellation queryCancellation;
 
@@ -106,8 +107,9 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
             // If we have a suggest CompletionQuery then the CompletionWeight#bulkScorer() will check that
             // the terms are instanceof CompletionTerms (not generic FilterTerms) and will throw an exception
             // if that's not the case.
-            return (queryCancellation.isEnabled() && terms instanceof CompletionTerms == false) ?
-                    new ExitableTerms(terms, queryCancellation) : terms;
+            return (queryCancellation.isEnabled() && terms instanceof CompletionTerms == false)
+                ? new ExitableTerms(terms, queryCancellation)
+                : terms;
         }
 
         @Override
@@ -119,6 +121,72 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         public CacheHelper getReaderCacheHelper() {
             return in.getReaderCacheHelper();
         }
+
+        @Override
+        protected StoredFieldsReader doGetSequentialStoredFieldsReader(StoredFieldsReader reader) {
+            return reader;
+        }
+
+        @Override
+        public ByteVectorValues getByteVectorValues(String field) throws IOException {
+            ByteVectorValues vectorValues = in.getByteVectorValues(field);
+            if (vectorValues == null) {
+                return null;
+            }
+            return queryCancellation.isEnabled() ? new ExitableByteVectorValues(queryCancellation, vectorValues) : vectorValues;
+        }
+
+        @Override
+        public void searchNearestVectors(String field, byte[] target, KnnCollector collector, Bits acceptDocs) throws IOException {
+            if (queryCancellation.isEnabled() == false) {
+                in.searchNearestVectors(field, target, collector, acceptDocs);
+                return;
+            }
+            in.searchNearestVectors(field, target, collector, new TimeOutCheckingBits(acceptDocs));
+        }
+
+        @Override
+        public FloatVectorValues getFloatVectorValues(String field) throws IOException {
+            FloatVectorValues vectorValues = in.getFloatVectorValues(field);
+            if (vectorValues == null) {
+                return null;
+            }
+            return queryCancellation.isEnabled() ? new ExitableFloatVectorValues(vectorValues, queryCancellation) : vectorValues;
+        }
+
+        @Override
+        public void searchNearestVectors(String field, float[] target, KnnCollector collector, Bits acceptDocs) throws IOException {
+            if (queryCancellation.isEnabled() == false) {
+                in.searchNearestVectors(field, target, collector, acceptDocs);
+                return;
+            }
+            in.searchNearestVectors(field, target, collector, new TimeOutCheckingBits(acceptDocs));
+        }
+
+        private class TimeOutCheckingBits implements Bits {
+            private static final int MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK = 10;
+            private final Bits updatedAcceptDocs;
+            private int calls;
+
+            TimeOutCheckingBits(Bits acceptDocs) {
+                // when acceptDocs is null due to no doc deleted, we will instantiate a new one that would
+                // match all docs to allow timeout checking.
+                this.updatedAcceptDocs = acceptDocs == null ? new Bits.MatchAllBits(maxDoc()) : acceptDocs;
+            }
+
+            @Override
+            public boolean get(int index) {
+                if (calls++ % MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK == 0) {
+                    queryCancellation.checkCancelled();
+                }
+                return updatedAcceptDocs.get(index);
+            }
+
+            @Override
+            public int length() {
+                return updatedAcceptDocs.length();
+            }
+        }
     }
 
     /**
@@ -128,7 +196,7 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
 
         private final QueryCancellation queryCancellation;
 
-        private ExitableTerms(Terms terms, QueryCancellation queryCancellation) {
+        ExitableTerms(Terms terms, QueryCancellation queryCancellation) {
             super(terms);
             this.queryCancellation = queryCancellation;
         }
@@ -141,6 +209,16 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         @Override
         public TermsEnum iterator() throws IOException {
             return new ExitableTermsEnum(in.iterator(), queryCancellation);
+        }
+
+        @Override
+        public BytesRef getMin() throws IOException {
+            return in.getMin();
+        }
+
+        @Override
+        public BytesRef getMax() throws IOException {
+            return in.getMax();
         }
     }
 
@@ -189,15 +267,9 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         }
 
         @Override
-        public void intersect(IntersectVisitor visitor) throws IOException {
+        public PointTree getPointTree() throws IOException {
             queryCancellation.checkCancelled();
-            in.intersect(new ExitableIntersectVisitor(visitor, queryCancellation));
-        }
-
-        @Override
-        public long estimatePointCount(IntersectVisitor visitor) {
-            queryCancellation.checkCancelled();
-            return in.estimatePointCount(visitor);
+            return new ExitablePointTree(in, in.getPointTree(), queryCancellation);
         }
 
         @Override
@@ -243,17 +315,102 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         }
     }
 
-    private static class ExitableIntersectVisitor implements PointValues.IntersectVisitor {
+    private static class ExitablePointTree implements PointValues.PointTree {
 
-        private static final int MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK = (1 << 13) - 1; // 8191
-
-        private final PointValues.IntersectVisitor in;
+        private final PointValues pointValues;
+        private final PointValues.PointTree in;
+        private final ExitableIntersectVisitor exitableIntersectVisitor;
         private final QueryCancellation queryCancellation;
         private int calls;
 
-        private ExitableIntersectVisitor(PointValues.IntersectVisitor in, QueryCancellation queryCancellation) {
+        private ExitablePointTree(PointValues pointValues, PointValues.PointTree in, QueryCancellation queryCancellation) {
+            this.pointValues = pointValues;
             this.in = in;
             this.queryCancellation = queryCancellation;
+            this.exitableIntersectVisitor = new ExitableIntersectVisitor(queryCancellation);
+        }
+
+        /**
+         * Throws {@link org.apache.lucene.index.ExitableDirectoryReader.ExitingReaderException}
+         * if {@link QueryTimeout#shouldExit()} returns true, or
+         * if {@link Thread#interrupted()} returns true.
+         */
+        private void checkAndThrowWithSampling() {
+            if ((calls++ & ExitableIntersectVisitor.MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK) == 0) {
+                queryCancellation.checkCancelled();
+            }
+        }
+
+        @Override
+        public PointValues.PointTree clone() {
+            queryCancellation.checkCancelled();
+            return new ExitablePointTree(pointValues, in.clone(), queryCancellation);
+        }
+
+        @Override
+        public boolean moveToChild() throws IOException {
+            checkAndThrowWithSampling();
+            return in.moveToChild();
+        }
+
+        @Override
+        public boolean moveToSibling() throws IOException {
+            checkAndThrowWithSampling();
+            return in.moveToSibling();
+        }
+
+        @Override
+        public boolean moveToParent() throws IOException {
+            checkAndThrowWithSampling();
+            return in.moveToParent();
+        }
+
+        @Override
+        public byte[] getMinPackedValue() {
+            checkAndThrowWithSampling();
+            return in.getMinPackedValue();
+        }
+
+        @Override
+        public byte[] getMaxPackedValue() {
+            checkAndThrowWithSampling();
+            return in.getMaxPackedValue();
+        }
+
+        @Override
+        public long size() {
+            queryCancellation.checkCancelled();
+            return in.size();
+        }
+
+        @Override
+        public void visitDocIDs(PointValues.IntersectVisitor visitor) throws IOException {
+            queryCancellation.checkCancelled();
+            in.visitDocIDs(visitor);
+        }
+
+        @Override
+        public void visitDocValues(PointValues.IntersectVisitor visitor) throws IOException {
+            queryCancellation.checkCancelled();
+            exitableIntersectVisitor.setIntersectVisitor(visitor);
+            in.visitDocValues(exitableIntersectVisitor);
+        }
+    }
+
+    private static class ExitableIntersectVisitor implements PointValues.IntersectVisitor {
+
+        static final int MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK = (1 << 13) - 1; // 8191
+
+        private final QueryCancellation queryCancellation;
+        private PointValues.IntersectVisitor in;
+        private int calls;
+
+        private ExitableIntersectVisitor(QueryCancellation queryCancellation) {
+            this.queryCancellation = queryCancellation;
+        }
+
+        private void setIntersectVisitor(PointValues.IntersectVisitor in) {
+            this.in = in;
         }
 
         private void checkAndThrowWithSampling() {
@@ -269,9 +426,21 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
         }
 
         @Override
+        public void visit(DocIdSetIterator iterator) throws IOException {
+            checkAndThrowWithSampling();
+            in.visit(iterator);
+        }
+
+        @Override
         public void visit(int docID, byte[] packedValue) throws IOException {
             checkAndThrowWithSampling();
             in.visit(docID, packedValue);
+        }
+
+        @Override
+        public void visit(DocIdSetIterator iterator, byte[] packedValue) throws IOException {
+            checkAndThrowWithSampling();
+            in.visit(iterator, packedValue);
         }
 
         @Override
@@ -285,5 +454,88 @@ class ExitableDirectoryReader extends FilterDirectoryReader {
             queryCancellation.checkCancelled();
             in.grow(count);
         }
+    }
+
+    private static class ExitableByteVectorValues extends ByteVectorValues {
+        private int calls;
+        private final QueryCancellation queryCancellation;
+        private final ByteVectorValues in;
+
+        private ExitableByteVectorValues(QueryCancellation queryCancellation, ByteVectorValues in) {
+            this.queryCancellation = queryCancellation;
+            this.in = in;
+        }
+
+        @Override
+        public int dimension() {
+            return in.dimension();
+        }
+
+        @Override
+        public int size() {
+            return in.size();
+        }
+
+        @Override
+        public byte[] vectorValue() throws IOException {
+            return in.vectorValue();
+        }
+
+        @Override
+        public int docID() {
+            return in.docID();
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            final int nextDoc = in.nextDoc();
+            checkAndThrowWithSampling();
+            return nextDoc;
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            final int advance = in.advance(target);
+            checkAndThrowWithSampling();
+            return advance;
+        }
+
+        private void checkAndThrowWithSampling() {
+            if ((calls++ & ExitableIntersectVisitor.MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK) == 0) {
+                this.queryCancellation.checkCancelled();
+            }
+        }
+    }
+
+    private static class ExitableFloatVectorValues extends FilterVectorValues {
+        private int calls;
+        private final QueryCancellation queryCancellation;
+
+        ExitableFloatVectorValues(FloatVectorValues vectorValues, QueryCancellation queryCancellation) {
+            super(vectorValues);
+            this.queryCancellation = queryCancellation;
+            this.queryCancellation.checkCancelled();
+        }
+
+        @Override
+        public int advance(int target) throws IOException {
+            final int advance = super.advance(target);
+            checkAndThrowWithSampling();
+            return advance;
+        }
+
+        @Override
+        public int nextDoc() throws IOException {
+            final int nextDoc = super.nextDoc();
+            checkAndThrowWithSampling();
+            return nextDoc;
+        }
+
+        private void checkAndThrowWithSampling() {
+            if ((calls++ & ExitableIntersectVisitor.MAX_CALLS_BEFORE_QUERY_TIMEOUT_CHECK) == 0) {
+                this.queryCancellation.checkCancelled();
+            }
+        }
+
     }
 }

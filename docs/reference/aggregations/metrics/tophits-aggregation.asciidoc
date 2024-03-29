@@ -1,5 +1,8 @@
 [[search-aggregations-metrics-top-hits-aggregation]]
-=== Top Hits Aggregation
+=== Top hits aggregation
+++++
+<titleabbrev>Top hits</titleabbrev>
+++++
 
 A `top_hits` metric aggregator keeps track of the most relevant document being aggregated. This aggregator is intended
 to be used as a sub aggregator, so that the top matching documents can be aggregated per bucket.
@@ -24,6 +27,7 @@ The top_hits aggregation returns regular search hits, because of this many per h
 * <<highlighting,Highlighting>>
 * <<request-body-search-explain,Explain>>
 * <<named-queries,Named queries>>
+* <<search-fields-param,Search fields>>
 * <<source-filtering,Source filtering>>
 * <<stored-fields,Stored fields>>
 * <<script-fields,Script fields>>
@@ -41,7 +45,7 @@ by aggregations, use a <<query-dsl-function-score-query,`function_score`>> or
 
 ==== Example
 
-In the following example we group the sales by type and per type we show the last sale. 
+In the following example we group the sales by type and per type we show the last sale.
 For each sale only the date and price fields are being included in the source.
 
 [source,console]
@@ -411,3 +415,56 @@ the second slow of the `nested_child_field` field:
 ...
 --------------------------------------------------
 // NOTCONSOLE
+
+==== Use in pipeline aggregations
+
+`top_hits` can be used in pipeline aggregations that consume a single value per bucket, such as `bucket_selector`
+that applies per bucket filtering, similar to using a HAVING clause in SQL. This requires setting `size` to 1, and
+specifying the right path for the value to be passed to the wrapping aggregator. The latter can be a `_source`, a
+`_sort` or a `_score` value. For example:
+
+[source,console]
+--------------------------------------------------
+POST /sales/_search?size=0
+{
+  "aggs": {
+    "top_tags": {
+      "terms": {
+        "field": "type",
+        "size": 3
+      },
+      "aggs": {
+        "top_sales_hits": {
+          "top_hits": {
+            "sort": [
+              {
+                "date": {
+                  "order": "desc"
+                }
+              }
+            ],
+            "_source": {
+              "includes": [ "date", "price" ]
+            },
+            "size": 1
+          }
+        },
+        "having.top_salary": {
+          "bucket_selector": {
+            "buckets_path": {
+              "tp": "top_sales_hits[_source.price]"
+            },
+            "script": "params.tp < 180"
+          }
+        }
+      }
+    }
+  }
+}
+
+--------------------------------------------------
+// TEST[setup:sales]
+
+The `bucket_path` uses the `top_hits` name `top_sales_hits` and a keyword for the field providing the aggregate value,
+namely `_source` field `price` in the example above. Other options include `top_sales_hits[_sort]`, for filtering on the
+sort value `date` above, and `top_sales_hits[_score]`, for filtering on the score of the top hit.

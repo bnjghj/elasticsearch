@@ -1,33 +1,25 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.action.search;
 
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
+import org.elasticsearch.ExceptionsHelper;
 import org.elasticsearch.action.ActionListener;
+import org.elasticsearch.action.ActionType;
 import org.elasticsearch.action.support.ActionFilters;
 import org.elasticsearch.action.support.HandledTransportAction;
-import org.elasticsearch.client.node.NodeClient;
+import org.elasticsearch.client.internal.node.NodeClient;
 import org.elasticsearch.cluster.ClusterState;
 import org.elasticsearch.cluster.block.ClusterBlockLevel;
 import org.elasticsearch.cluster.service.ClusterService;
 import org.elasticsearch.common.inject.Inject;
-import org.elasticsearch.common.io.stream.Writeable;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.common.util.concurrent.AtomicArray;
 import org.elasticsearch.common.util.concurrent.EsExecutors;
@@ -43,6 +35,9 @@ import java.util.function.LongSupplier;
 
 public class TransportMultiSearchAction extends HandledTransportAction<MultiSearchRequest, MultiSearchResponse> {
 
+    public static final String NAME = "indices:data/read/msearch";
+    public static final ActionType<MultiSearchResponse> TYPE = new ActionType<>(NAME);
+    private static final Logger logger = LogManager.getLogger(TransportMultiSearchAction.class);
     private final int allocatedProcessors;
     private final ThreadPool threadPool;
     private final ClusterService clusterService;
@@ -50,9 +45,15 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
     private final NodeClient client;
 
     @Inject
-    public TransportMultiSearchAction(Settings settings, ThreadPool threadPool, TransportService transportService,
-                                      ClusterService clusterService, ActionFilters actionFilters, NodeClient client) {
-        super(MultiSearchAction.NAME, transportService, actionFilters, (Writeable.Reader<MultiSearchRequest>) MultiSearchRequest::new);
+    public TransportMultiSearchAction(
+        Settings settings,
+        ThreadPool threadPool,
+        TransportService transportService,
+        ClusterService clusterService,
+        ActionFilters actionFilters,
+        NodeClient client
+    ) {
+        super(TYPE.name(), transportService, actionFilters, MultiSearchRequest::new, EsExecutors.DIRECT_EXECUTOR_SERVICE);
         this.threadPool = threadPool;
         this.clusterService = clusterService;
         this.allocatedProcessors = EsExecutors.allocatedProcessors(settings);
@@ -60,10 +61,16 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
         this.client = client;
     }
 
-    TransportMultiSearchAction(ThreadPool threadPool, ActionFilters actionFilters, TransportService transportService,
-                               ClusterService clusterService, int allocatedProcessors,
-                               LongSupplier relativeTimeProvider, NodeClient client) {
-        super(MultiSearchAction.NAME, transportService, actionFilters, (Writeable.Reader<MultiSearchRequest>) MultiSearchRequest::new);
+    TransportMultiSearchAction(
+        ThreadPool threadPool,
+        ActionFilters actionFilters,
+        TransportService transportService,
+        ClusterService clusterService,
+        int allocatedProcessors,
+        LongSupplier relativeTimeProvider,
+        NodeClient client
+    ) {
+        super(TYPE.name(), transportService, actionFilters, MultiSearchRequest::new, EsExecutors.DIRECT_EXECUTOR_SERVICE);
         this.threadPool = threadPool;
         this.clusterService = clusterService;
         this.allocatedProcessors = allocatedProcessors;
@@ -107,7 +114,7 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
     static int defaultMaxConcurrentSearches(final int allocatedProcessors, final ClusterState state) {
         int numDateNodes = state.getNodes().getDataNodes().size();
         // we bound the default concurrency to preserve some search thread pool capacity for other searches
-        final int defaultSearchThreadPoolSize = Math.min(ThreadPool.searchThreadPoolSize(allocatedProcessors), 10);
+        final int defaultSearchThreadPoolSize = Math.min(ThreadPool.searchOrGetThreadPoolSize(allocatedProcessors), 10);
         return Math.max(1, numDateNodes * defaultSearchThreadPoolSize);
     }
 
@@ -121,11 +128,12 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
      * @param listener the listener attached to the multi-search request
      */
     void executeSearch(
-            final Queue<SearchRequestSlot> requests,
-            final AtomicArray<MultiSearchResponse.Item> responses,
-            final AtomicInteger responseCounter,
-            final ActionListener<MultiSearchResponse> listener,
-            final long relativeStartTime) {
+        final Queue<SearchRequestSlot> requests,
+        final AtomicArray<MultiSearchResponse.Item> responses,
+        final AtomicInteger responseCounter,
+        final ActionListener<MultiSearchResponse> listener,
+        final long relativeStartTime
+    ) {
         SearchRequestSlot request = requests.poll();
         if (request == null) {
             /*
@@ -146,14 +154,18 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
          * when we handle the response rather than going recursive, we fork to another thread, otherwise we recurse.
          */
         final Thread thread = Thread.currentThread();
-        client.search(request.request, new ActionListener<SearchResponse>() {
+        client.search(request.request, new ActionListener<>() {
             @Override
             public void onResponse(final SearchResponse searchResponse) {
+                searchResponse.mustIncRef(); // acquire reference on behalf of MultiSearchResponse.Item below
                 handleResponse(request.responseSlot, new MultiSearchResponse.Item(searchResponse, null));
             }
 
             @Override
             public void onFailure(final Exception e) {
+                if (ExceptionsHelper.status(e).getStatus() >= 500 && ExceptionsHelper.isNodeOrShardUnavailableTypeException(e) == false) {
+                    logger.warn("TransportMultiSearchAction failure", e);
+                }
                 handleResponse(request.responseSlot, new MultiSearchResponse.Item(null, e));
             }
 
@@ -166,7 +178,7 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
                     if (thread == Thread.currentThread()) {
                         // we are on the same thread, we need to fork to another thread to avoid recursive stack overflow on a single thread
                         threadPool.generic()
-                                .execute(() -> executeSearch(requests, responses, responseCounter, listener, relativeStartTime));
+                            .execute(() -> executeSearch(requests, responses, responseCounter, listener, relativeStartTime));
                     } else {
                         // we are on a different thread (we went asynchronous), it's safe to recurse
                         executeSearch(requests, responses, responseCounter, listener, relativeStartTime);
@@ -175,8 +187,10 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
             }
 
             private void finish() {
-                listener.onResponse(new MultiSearchResponse(responses.toArray(new MultiSearchResponse.Item[responses.length()]),
-                        buildTookInMillis()));
+                ActionListener.respondAndRelease(
+                    listener,
+                    new MultiSearchResponse(responses.toArray(new MultiSearchResponse.Item[responses.length()]), buildTookInMillis())
+                );
             }
 
             /**
@@ -188,14 +202,7 @@ public class TransportMultiSearchAction extends HandledTransportAction<MultiSear
         });
     }
 
-    static final class SearchRequestSlot {
+    record SearchRequestSlot(SearchRequest request, int responseSlot) {
 
-        final SearchRequest request;
-        final int responseSlot;
-
-        SearchRequestSlot(SearchRequest request, int responseSlot) {
-            this.request = request;
-            this.responseSlot = responseSlot;
-        }
     }
 }

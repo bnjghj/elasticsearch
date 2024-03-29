@@ -54,7 +54,7 @@ GET /_search
         "max_expansions": 50,
         "prefix_length": 0,
         "transpositions": true,
-        "rewrite": "constant_score"
+        "rewrite": "constant_score_blended"
       }
     }
   }
@@ -92,7 +92,7 @@ variations examined.
 expansions. Defaults to `0`.
 
 `transpositions`::
-(Optional, boolean) Indicates whether edits include transpositions of two
+(Optional, Boolean) Indicates whether edits include transpositions of two
 adjacent characters (ab → ba). Defaults to `true`.
 
 `rewrite`::

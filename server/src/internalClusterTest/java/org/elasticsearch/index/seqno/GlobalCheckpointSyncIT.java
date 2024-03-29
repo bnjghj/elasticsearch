@@ -1,30 +1,19 @@
 /*
- * Licensed to Elasticsearch under one or more contributor
- * license agreements. See the NOTICE file distributed with
- * this work for additional information regarding copyright
- * ownership. Elasticsearch licenses this file to you under
- * the Apache License, Version 2.0 (the "License"); you may
- * not use this file except in compliance with the License.
- * You may obtain a copy of the License at
- *
- *    http://www.apache.org/licenses/LICENSE-2.0
- *
- * Unless required by applicable law or agreed to in writing,
- * software distributed under the License is distributed on an
- * "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
- * KIND, either express or implied.  See the License for the
- * specific language governing permissions and limitations
- * under the License.
+ * Copyright Elasticsearch B.V. and/or licensed to Elasticsearch B.V. under one
+ * or more contributor license agreements. Licensed under the Elastic License
+ * 2.0 and the Server Side Public License, v 1; you may not use this file except
+ * in compliance with, at your election, the Elastic License 2.0 or the Server
+ * Side Public License, v 1.
  */
 
 package org.elasticsearch.index.seqno;
 
-import org.elasticsearch.client.Client;
+import org.apache.lucene.store.AlreadyClosedException;
+import org.elasticsearch.client.internal.Client;
 import org.elasticsearch.cluster.node.DiscoveryNode;
 import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.settings.Settings;
-import org.elasticsearch.common.unit.TimeValue;
-import org.elasticsearch.common.xcontent.XContentType;
+import org.elasticsearch.core.TimeValue;
 import org.elasticsearch.index.IndexService;
 import org.elasticsearch.index.IndexSettings;
 import org.elasticsearch.index.shard.IndexShard;
@@ -34,7 +23,7 @@ import org.elasticsearch.plugins.Plugin;
 import org.elasticsearch.test.ESIntegTestCase;
 import org.elasticsearch.test.InternalSettingsPlugin;
 import org.elasticsearch.test.transport.MockTransportService;
-import org.elasticsearch.transport.TransportService;
+import org.elasticsearch.xcontent.XContentType;
 
 import java.util.ArrayList;
 import java.util.Collection;
@@ -43,7 +32,6 @@ import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.CyclicBarrier;
 import java.util.concurrent.TimeUnit;
 import java.util.function.Consumer;
-import java.util.stream.Collectors;
 import java.util.stream.Stream;
 
 import static org.hamcrest.Matchers.equalTo;
@@ -52,10 +40,8 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
 
     @Override
     protected Collection<Class<? extends Plugin>> nodePlugins() {
-        return Stream.concat(
-                super.nodePlugins().stream(),
-                Stream.of(InternalSettingsPlugin.class, MockTransportService.TestPlugin.class))
-                .collect(Collectors.toList());
+        return Stream.concat(super.nodePlugins().stream(), Stream.of(InternalSettingsPlugin.class, MockTransportService.TestPlugin.class))
+            .toList();
     }
 
     public void testGlobalCheckpointSyncWithAsyncDurability() throws Exception {
@@ -66,16 +52,16 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
                 .put(IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(), "1s")
                 .put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.ASYNC)
                 .put(IndexSettings.INDEX_TRANSLOG_SYNC_INTERVAL_SETTING.getKey(), "1s")
-                .put("index.number_of_replicas", 1))
-            .get();
+                .put("index.number_of_replicas", 1)
+        ).get();
 
         for (int j = 0; j < 10; j++) {
             final String id = Integer.toString(j);
-            client().prepareIndex("test").setId(id).setSource("{\"foo\": " + id + "}", XContentType.JSON).get();
+            prepareIndex("test").setId(id).setSource("{\"foo\": " + id + "}", XContentType.JSON).get();
         }
 
         assertBusy(() -> {
-            SeqNoStats seqNoStats = client().admin().indices().prepareStats("test").get().getIndex("test").getShards()[0].getSeqNoStats();
+            SeqNoStats seqNoStats = indicesAdmin().prepareStats("test").get().getIndex("test").getShards()[0].getSeqNoStats();
             assertThat(seqNoStats.getGlobalCheckpoint(), equalTo(seqNoStats.getMaxSeqNo()));
         });
     }
@@ -84,11 +70,15 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
         // set the sync interval high so it does not execute during this test. This only allows the global checkpoint to catch up
         // on a post-operation background sync if translog durability is set to sync. Async durability relies on a scheduled global
         // checkpoint sync to allow the information about persisted local checkpoints to be transferred to the primary.
-        runGlobalCheckpointSyncTest(TimeValue.timeValueHours(24),
-            client ->
-                client.admin().indices().prepareUpdateSettings("test").setSettings(Settings.builder()
-                    .put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.REQUEST)).get(),
-            client -> {});
+        runGlobalCheckpointSyncTest(
+            TimeValue.timeValueHours(24),
+            client -> client.admin()
+                .indices()
+                .prepareUpdateSettings("test")
+                .setSettings(Settings.builder().put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.REQUEST))
+                .get(),
+            client -> {}
+        );
     }
 
     /*
@@ -96,61 +86,54 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
      * test so that a background sync can fire and sync the global checkpoint.
      */
     public void testBackgroundGlobalCheckpointSync() throws Exception {
-        runGlobalCheckpointSyncTest(
-                TimeValue.timeValueSeconds(randomIntBetween(1, 3)),
-                client -> {
-                    // prevent global checkpoint syncs between all nodes
-                    final DiscoveryNodes nodes = client.admin().cluster().prepareState().get().getState().getNodes();
-                    for (final DiscoveryNode node : nodes) {
-                        for (final DiscoveryNode other : nodes) {
-                            if (node == other) {
-                                continue;
-                            }
-                            final MockTransportService senderTransportService =
-                                    (MockTransportService) internalCluster().getInstance(TransportService.class, node.getName());
-                            final MockTransportService receiverTransportService =
-                                    (MockTransportService) internalCluster().getInstance(TransportService.class, other.getName());
-                            senderTransportService.addSendBehavior(receiverTransportService,
-                                (connection, requestId, action, request, options) -> {
-                                    if ("indices:admin/seq_no/global_checkpoint_sync[r]".equals(action)) {
-                                        throw new IllegalStateException("blocking indices:admin/seq_no/global_checkpoint_sync[r]");
-                                    } else {
-                                        connection.sendRequest(requestId, action, request, options);
-                                    }
-                                });
-                        }
+        runGlobalCheckpointSyncTest(TimeValue.timeValueSeconds(randomIntBetween(1, 3)), client -> {
+            // prevent global checkpoint syncs between all nodes
+            final DiscoveryNodes nodes = client.admin().cluster().prepareState().get().getState().getNodes();
+            for (final DiscoveryNode node : nodes) {
+                for (final DiscoveryNode other : nodes) {
+                    if (node == other) {
+                        continue;
                     }
-                },
-                client -> {
-                    // restore global checkpoint syncs between all nodes
-                    final DiscoveryNodes nodes = client.admin().cluster().prepareState().get().getState().getNodes();
-                    for (final DiscoveryNode node : nodes) {
-                        for (final DiscoveryNode other : nodes) {
-                            if (node == other) {
-                                continue;
+                    MockTransportService.getInstance(node.getName())
+                        .addSendBehavior(
+                            MockTransportService.getInstance(other.getName()),
+                            (connection, requestId, action, request, options) -> {
+                                if ("indices:admin/seq_no/global_checkpoint_sync[r]".equals(action)) {
+                                    throw new IllegalStateException("blocking indices:admin/seq_no/global_checkpoint_sync[r]");
+                                } else {
+                                    connection.sendRequest(requestId, action, request, options);
+                                }
                             }
-                            final MockTransportService senderTransportService =
-                                    (MockTransportService) internalCluster().getInstance(TransportService.class, node.getName());
-                            final MockTransportService receiverTransportService =
-                                    (MockTransportService) internalCluster().getInstance(TransportService.class, other.getName());
-                            senderTransportService.clearOutboundRules(receiverTransportService);
-                        }
+                        );
+                }
+            }
+        }, client -> {
+            // restore global checkpoint syncs between all nodes
+            final DiscoveryNodes nodes = client.admin().cluster().prepareState().get().getState().getNodes();
+            for (final DiscoveryNode node : nodes) {
+                for (final DiscoveryNode other : nodes) {
+                    if (node == other) {
+                        continue;
                     }
-                });
+                    MockTransportService.getInstance(node.getName()).clearOutboundRules(MockTransportService.getInstance(other.getName()));
+                }
+            }
+        });
     }
 
     private void runGlobalCheckpointSyncTest(
-            final TimeValue globalCheckpointSyncInterval,
-            final Consumer<Client> beforeIndexing,
-            final Consumer<Client> afterIndexing) throws Exception {
+        final TimeValue globalCheckpointSyncInterval,
+        final Consumer<Client> beforeIndexing,
+        final Consumer<Client> afterIndexing
+    ) throws Exception {
         final int numberOfReplicas = randomIntBetween(1, 4);
         internalCluster().ensureAtLeastNumDataNodes(1 + numberOfReplicas);
         prepareCreate(
-                "test",
-                Settings.builder()
-                        .put(IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(), globalCheckpointSyncInterval)
-                        .put("index.number_of_replicas", numberOfReplicas))
-                .get();
+            "test",
+            Settings.builder()
+                .put(IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(), globalCheckpointSyncInterval)
+                .put("index.number_of_replicas", numberOfReplicas)
+        ).get();
         if (randomBoolean()) {
             ensureGreen();
         }
@@ -174,7 +157,7 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
                 }
                 for (int j = 0; j < numberOfDocuments; j++) {
                     final String id = Integer.toString(index * numberOfDocuments + j);
-                    client().prepareIndex("test").setId(id).setSource("{\"foo\": " + id + "}", XContentType.JSON).get();
+                    prepareIndex("test").setId(id).setSource("{\"foo\": " + id + "}", XContentType.JSON).get();
                 }
                 try {
                     barrier.await();
@@ -199,9 +182,21 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
                 for (IndexService indexService : indicesService) {
                     for (IndexShard shard : indexService) {
                         if (shard.routingEntry().primary()) {
-                            final SeqNoStats seqNoStats = shard.seqNoStats();
-                            assertThat("shard " + shard.routingEntry() + " seq_no [" + seqNoStats + "]",
-                                seqNoStats.getGlobalCheckpoint(), equalTo(seqNoStats.getMaxSeqNo()));
+                            try {
+                                final SeqNoStats seqNoStats = shard.seqNoStats();
+                                assertThat(
+                                    "shard " + shard.routingEntry() + " seq_no [" + seqNoStats + "]",
+                                    seqNoStats.getGlobalCheckpoint(),
+                                    equalTo(seqNoStats.getMaxSeqNo())
+                                );
+                            } catch (AlreadyClosedException e) {
+                                logger.error(
+                                    "received unexpected AlreadyClosedException when fetching stats for shard: {}, shard state: {}",
+                                    shard.shardId(),
+                                    shard.state()
+                                );
+                                throw e;
+                            }
                         }
                     }
                 }
@@ -228,7 +223,7 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
         }
         int numDocs = randomIntBetween(1, 20);
         for (int i = 0; i < numDocs; i++) {
-            client().prepareIndex("test").setId(Integer.toString(i)).setSource("{}", XContentType.JSON).get();
+            prepareIndex("test").setId(Integer.toString(i)).setSource("{}", XContentType.JSON).get();
         }
         ensureGreen("test");
         assertBusy(() -> {
@@ -247,18 +242,17 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
 
     public void testPersistLocalCheckpoint() {
         internalCluster().ensureAtLeastNumDataNodes(2);
-        Settings.Builder indexSettings = Settings.builder()
-            .put(IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(), "10m")
-            .put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.REQUEST)
-            .put("index.number_of_shards", 1)
-            .put("index.number_of_replicas", randomIntBetween(0, 1));
+        Settings.Builder indexSettings = indexSettings(1, randomIntBetween(0, 1)).put(
+            IndexService.GLOBAL_CHECKPOINT_SYNC_INTERVAL_SETTING.getKey(),
+            "10m"
+        ).put(IndexSettings.INDEX_TRANSLOG_DURABILITY_SETTING.getKey(), Translog.Durability.REQUEST);
         prepareCreate("test", indexSettings).get();
         ensureGreen("test");
         int numDocs = randomIntBetween(1, 20);
         logger.info("numDocs {}", numDocs);
         long maxSeqNo = 0;
         for (int i = 0; i < numDocs; i++) {
-            maxSeqNo = client().prepareIndex("test").setId(Integer.toString(i)).setSource("{}", XContentType.JSON).get().getSeqNo();
+            maxSeqNo = prepareIndex("test").setId(Integer.toString(i)).setSource("{}", XContentType.JSON).get().getSeqNo();
             logger.info("got {}", maxSeqNo);
         }
         for (IndicesService indicesService : internalCluster().getDataNodeInstances(IndicesService.class)) {
@@ -266,7 +260,8 @@ public class GlobalCheckpointSyncIT extends ESIntegTestCase {
                 for (IndexShard shard : indexService) {
                     final SeqNoStats seqNoStats = shard.seqNoStats();
                     assertThat(maxSeqNo, equalTo(seqNoStats.getMaxSeqNo()));
-                    assertThat(seqNoStats.getLocalCheckpoint(), equalTo(seqNoStats.getMaxSeqNo()));;
+                    assertThat(seqNoStats.getLocalCheckpoint(), equalTo(seqNoStats.getMaxSeqNo()));
+                    ;
                 }
             }
         }
